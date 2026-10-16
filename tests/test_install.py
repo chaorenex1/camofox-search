@@ -52,6 +52,18 @@ def test_install_copies_and_hash_verifies(hermes_home, capsys):
     assert "next steps" in capsys.readouterr().out
 
 
+def test_install_deploys_cookie_sync_script(hermes_home, capsys):
+    rc = installer.install_plugin(
+        source=PLUGIN_SOURCE, hermes_home=hermes_home, replace=False, dry_run=False)
+
+    assert rc == 0
+    deployed = hermes_home / "scripts" / "camofox_cookie_sync.py"
+    assert deployed.is_file()
+    assert deployed.read_bytes() == \
+        installer.cookie_sync_script_source().read_bytes()
+    assert "camofox_cookie_sync.py" in capsys.readouterr().out
+
+
 def test_refuses_existing_target_without_replace(hermes_home, capsys):
     destination = hermes_home / "plugins" / "web" / "camofox_search"
     destination.mkdir(parents=True)

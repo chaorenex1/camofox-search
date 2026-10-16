@@ -18,6 +18,7 @@ import os
 
 DEFAULT_BASE_URL = "http://localhost:9377"
 DEFAULT_ENGINE = "bing"
+DEFAULT_USER_ID = "camofox_search"
 DEFAULT_TIMEOUT_SECONDS = 45.0
 
 
@@ -69,6 +70,16 @@ def camofox_timeout() -> float:
     except (TypeError, ValueError):
         return DEFAULT_TIMEOUT_SECONDS
     return val if val > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def camofox_user_id() -> str:
+    """Camofox user/profile id the plugin browses with.
+
+    One stable id (:data:`DEFAULT_USER_ID`, override ``CAMOFOX_SEARCH_USER_ID``)
+    keeps the browser profile persistent, so cookies imported by
+    ``camofox-search-import-cookies`` apply to every search and extraction.
+    """
+    return (_env_value("CAMOFOX_SEARCH_USER_ID") or DEFAULT_USER_ID).strip()
 
 
 def default_engine() -> str:

@@ -12,15 +12,26 @@ anti-detection browser (Camoufox engine) instead of a hosted search API.
 - Advanced search: the bundled `camofox-search-advance` tool builds per-engine
   SERP URLs (operators, time/language/region/vertical/pagination filters) and
   can execute them — see "Advanced search" below
+- Cookies: the bundled `camofox-search-import-cookies` tool (plus a
+  "every 72h" scheduled refresh) copies the user's local-browser cookies into
+  the plugin's Camofox profile — see "Cookies" below
 
 ## How it works
 
-Each `search()` call opens one throwaway Camofox session (a unique `userId`),
-navigates it to the selected engine's result page, extracts organic results from
-the page DOM via the Camofox `/evaluate` endpoint, and tears the session down in
-a `finally` block. `extract()` does the same per URL and returns readable page
-text. Plugin activity therefore never leaks into the browser sessions Hermes'
-own `browser_*` tools own.
+Every call opens its own *tab* inside one stable, plugin-owned Camofox profile
+(`CAMOFOX_SEARCH_USER_ID`, default `camofox_search`): search navigates the tab
+to the selected engine's result page, extracts organic results from the page
+DOM via the Camofox `/evaluate` endpoint, and closes the tab in a `finally`
+block; `extract()` does the same per URL and returns readable page text. One
+stable profile means cookies imported from the local browser (see "Cookies"
+below) apply to every search/extraction, and the daemon's own lifecycle
+reclaims idle contexts. Plugin activity never leaks into the browser sessions
+Hermes' own `browser_*` tools own.
+
+The profile keeps one idle blank *holder* tab: Camoufox destroys its browser
+window when the last tab closes and then refuses new pages, so the holder is
+what lets per-call tabs come and go. A context that still ends up broken
+(daemon restart, reaped holder) is reset and retried once, transparently.
 
 Engine selection is rule-driven: the rule database is consulted first — a rule
 matching the configured engine resolves the SERP URL template and extraction JS
@@ -103,6 +114,36 @@ the option support matrix, extraction resolution and workflows, with
 per-engine deep references in `references/engines-cn.md` and
 `references/engines-intl.md`.
 
+## Cookies (local browser → Camofox)
+
+**Tool** — `camofox-search-import-cookies` copies cookies from the user's own
+browser into the Camofox profile the plugin browses with, so searches and
+extractions carry the user's logins / consent / clearance cookies.
+
+- `action: "detect"` — lists every detected browser profile with a cookie
+  database (Chrome, Edge, Brave, Chromium, Vivaldi, Firefox under the standard
+  Windows paths) plus whether a CDP fallback port answers.
+- `action: "run"` — exports the chosen profile (`browser`, `profile`;
+  `auto` = most recently used; optional `domains` suffix filter), imports it
+  in ≤500-cookie batches into `user_id` (default the plugin's profile) and
+  verifies the round trip on a scratch tab. `dry_run: true` stops after the
+  export. Only counts and skip reasons are returned — never cookie values.
+- Sources and limits: Chromium cookies are AES-256-GCM values under a
+  DPAPI-protected key in `Local State` (current builds add a 32-byte binding
+  prefix that is stripped; app-bound `v20` values are skipped); Firefox
+  `cookies.sqlite` is plaintext. A *running* Chromium-family browser locks its
+  cookie DB — the tool then falls back to a CDP export on
+  `127.0.0.1:9222` (override `CAMOFOX_SEARCH_CDP_PORTS`) when a browser with
+  `--remote-debugging-port` is reachable, and otherwise reports exactly what
+  to close or re-run.
+
+**Scheduled refresh** — `scripts/camofox_cookie_sync.py` (deployed to
+`$HERMES_HOME/scripts/` by the installer) runs the same import and prints a
+one-line, value-free summary; a `no_agent` cron job ("every 72h") executes it.
+When the local browser is open and no CDP port answers, the run exits non-zero
+with the actionable message so the job history shows it — close the browser
+(or enable a debug port) before the next fire.
+
 ## Layout
 
 ```
@@ -110,16 +151,19 @@ plugin/camofox_search/          Plugin source (install target: $HERMES_HOME/plug
   plugin.yaml                   Manifest: kind=backend, provides_web_providers, provides_tools
   __init__.py                   register(ctx): provider + tools + bundled skills
   provider.py                   CamofoxSearchProvider (rule-aware search/extract)
-  client.py                     Camofox REST client (tab lifecycle, Bearer auth)
+  client.py                     Camofox REST client (tab lifecycle, cookies, Bearer auth)
   engines.py                    Built-in engines as data: domain + URL/JS templates
   advanced.py                   Advanced engine catalog + URL builder (operators/filters)
   rules.py                      SQLite rule store ($HERMES_HOME/camofox-search/, WAL)
   manage.py                     camofox-search-manage tool (rules CRUD)
   advance.py                    camofox-search-advance tool (build/run advanced searches)
+  cookies.py                    Local-browser cookie export (DPAPI/AES-GCM, CDP) + import
+  import_cookies.py             camofox-search-import-cookies tool
   settings.py                   Env resolution (secret scope -> process env -> Hermes .env)
   skills/camofox-search-rule/   Bundled skill (rules maintenance)
   skills/camofox-search-advance/ Bundled skill (engine catalog + references/)
-scripts/install_dev_plugin.py   Copy installer (validates, backs up, verifies hashes)
+scripts/install_dev_plugin.py   Copy installer (validates, backs up, verifies, deploys cron script)
+scripts/camofox_cookie_sync.py  Scheduled cookie refresh (no-agent cron script)
 scripts/smoke_live.py           Live end-to-end smoke (search/extract/advance) vs a live server
 tests/                          Offline unit tests (no network, no daemon required)
 ```

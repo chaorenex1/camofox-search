@@ -40,7 +40,14 @@ class FakeClient:
             return self.ready_state
         return self.evaluate_result
 
-    def close_session(self, user_id):
+    def close_tab(self, tab_id, user_id):
+        self.calls.append(("close_tab", tab_id, user_id))
+
+    def list_tabs(self, user_id=None):
+        self.calls.append(("list_tabs", user_id))
+        return [{"tabId": "holder", "url": "about:blank"}]
+
+    def close_session(self, user_id):  # pragma: no cover - must not be called
         self.calls.append(("close_session", user_id))
 
 
@@ -132,7 +139,8 @@ def test_run_mode_bing_builds_advanced_url_and_returns_rows(fake_client):
                          "&filters=ex1%3A%22ez2%22&first=11&count=5")
     # rule-first resolution: cn.bing.com matches the seeded bing.com rule
     assert payload["extractor"] == "rule:bing.com"
-    assert len(_calls(client, "close_session")) == 1
+    assert len(_calls(client, "close_tab")) == 1
+    assert _calls(client, "close_session") == []
 
 
 def test_run_mode_uses_builtin_extractor_when_no_rule(fake_client):

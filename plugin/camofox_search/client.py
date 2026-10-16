@@ -112,14 +112,49 @@ class CamofoxClient:
         """Unique per-call ``userId`` so concurrent calls never share a tab."""
         return f"camofox_search_{uuid.uuid4().hex[:12]}"
 
-    def create_tab(self, user_id: str, url: str, session_key: str = "camofox_search") -> str:
-        """Create a tab for ``user_id`` opened at ``url``; returns the tab id."""
-        data = self._request("post", "/tabs", json_body={
-            "userId": user_id, "sessionKey": session_key, "url": url})
+    def create_tab(self, user_id: str, url: str = "", session_key: str = "camofox_search") -> str:
+        """Create a tab for ``user_id`` (optionally opened at ``url``); returns the tab id."""
+        payload: dict[str, Any] = {"userId": user_id, "sessionKey": session_key}
+        if url:
+            payload["url"] = url
+        data = self._request("post", "/tabs", json_body=payload)
         tab_id = data.get("tabId") if isinstance(data, dict) else None
         if not tab_id:
             raise CamofoxError(f"Camofox created no tab (response: {data!r})")
         return str(tab_id)
+
+    def list_tabs(self, user_id: Optional[str] = None) -> list[dict]:
+        """The daemon's open tabs (optionally for one user)."""
+        params = {"userId": user_id} if user_id else None
+        data = self._request("get", "/tabs", params=params)
+        tabs = data.get("tabs") if isinstance(data, dict) else None
+        return tabs if isinstance(tabs, list) else []
+
+    def close_tab(self, tab_id: str, user_id: str) -> None:
+        """Close one tab (the daemon requires ``userId`` in the body)."""
+        self._request("delete", f"/tabs/{tab_id}", json_body={"userId": user_id})
+
+    # ---- cookies ----
+
+    def set_cookies(self, user_id: str, cookies: list[dict[str, Any]],
+                    tab_id: Optional[str] = None) -> dict:
+        """Import Playwright-format cookies into ``user_id``'s browser context.
+
+        The daemon caps one request at 500 cookies; callers batch
+        (:func:`cookies.import_cookies`). With a ``tab_id`` the import targets
+        that tab's context unambiguously.
+        """
+        body: dict[str, Any] = {"cookies": cookies}
+        if tab_id:
+            body["tabId"] = tab_id
+        data = self._request("post", f"/sessions/{user_id}/cookies", json_body=body)
+        return data if isinstance(data, dict) else {}
+
+    def get_tab_cookies(self, tab_id: str, user_id: Optional[str] = None) -> list:
+        """Read back the cookies of a tab's browser context (verification)."""
+        params = {"userId": user_id} if user_id else None
+        data = self._request("get", f"/tabs/{tab_id}/cookies", params=params)
+        return data if isinstance(data, list) else []
 
     def navigate(self, tab_id: str, user_id: str, url: str) -> dict:
         """Navigate an existing tab (kept for callers that reopen a tab)."""

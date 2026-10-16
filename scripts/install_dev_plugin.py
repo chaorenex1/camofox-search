@@ -23,7 +23,7 @@ PLUGIN_DESTINATION_RELATIVE = Path("plugins") / "web" / "camofox_search"
 BACKUP_ROOT_RELATIVE = Path("backups") / "plugins" / "web"
 _REQUIRED_PLUGIN_FILES = (
     "__init__.py", "plugin.yaml", "provider.py", "client.py", "engines.py", "settings.py",
-    "rules.py", "manage.py", "advance.py", "advanced.py",
+    "rules.py", "manage.py", "advance.py", "advanced.py", "cookies.py", "import_cookies.py",
     "skills/camofox-search-rule/SKILL.md",
     "skills/camofox-search-advance/SKILL.md",
     "skills/camofox-search-advance/references/engines-cn.md",
@@ -86,6 +86,11 @@ def _validate_plugin_source(source: Path) -> Optional[str]:
     return None
 
 
+def cookie_sync_script_source() -> Path:
+    """The scheduled cookie-refresh script shipped next to the plugin."""
+    return PLUGIN_SOURCE.parents[1] / "scripts" / "camofox_cookie_sync.py"
+
+
 def backup_path_for(backup_home: Path, destination: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return backup_home / f"{destination.name}.backup-{timestamp}"
@@ -123,6 +128,10 @@ def install_plugin(
         if destination.exists():
             print(f"[dry-run] would back up {destination} under {backup_home}")
         print(f"[dry-run] {len(source_hashes)} file(s) would be copied and hash-verified")
+        script_source = cookie_sync_script_source()
+        if script_source.is_file():
+            print(f"[dry-run] would copy scripts/{script_source.name} -> "
+                  f"{hermes_home / 'scripts'}")
         return 0
 
     if destination.exists():
@@ -144,6 +153,16 @@ def install_plugin(
         return 1
 
     print(f"{action}ed {len(installed_hashes)} file(s) -> {destination}")
+
+    # The scheduled cookie-refresh cron job references this script by name
+    # under <hermes-home>/scripts/ — keep the deployed copy in sync too.
+    script_source = cookie_sync_script_source()
+    scripts_dir = hermes_home / "scripts"
+    if script_source.is_file():
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(script_source, scripts_dir / script_source.name)
+        print(f"deployed {script_source.name} -> {scripts_dir}")
+
     print("next steps:")
     print("  hermes plugins enable web/camofox_search")
     print("  hermes config set web.search_backend camofox-search   # optional")

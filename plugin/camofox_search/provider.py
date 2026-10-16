@@ -1,9 +1,13 @@
 """Camofox-backed web-search provider: search + page extraction through the
 self-hosted Camofox anti-detection browser.
 
-Every call runs in its own throwaway Camofox session (unique ``userId``) which
-is torn down in a ``finally`` block, so plugin activity never leaks into the
-browser sessions Hermes' own ``browser_*`` tools own.
+Every call opens its own *tab* inside one persistent, plugin-owned Camofox
+profile (``camofox_user_id()``, default ``camofox_search``) and closes that tab
+in a ``finally`` block. Keeping one stable profile means cookies imported by
+``camofox-search-import-cookies`` (from the user's local browser) apply to
+every search/extraction, while the daemon's own lifecycle still reclaims idle
+contexts. Plugin activity never leaks into the browser sessions Hermes' own
+``browser_*`` tools own.
 
 Engine selection is rule-driven: the rule database (``HERMES_HOME/camofox-search/
 camofox-search.db``, see :mod:`rules`) is consulted first — a rule matching the
@@ -38,7 +42,7 @@ from .engines import (
     render_url_template,
 )
 from .rules import Rule
-from .settings import camofox_configured, default_engine
+from .settings import camofox_configured, camofox_user_id, default_engine
 
 logger = logging.getLogger(__name__)
 
@@ -153,19 +157,62 @@ def _search_plan(selector: str, query: str, limit: int) -> tuple[str, str, str]:
     return engine.build_url(query, limit), engine.extract_js(limit), f"engine:{engine.name}"
 
 
+def ensure_profile_tab(client: CamofoxClient, user_id: str) -> bool:
+    """Keep one blank holder tab so the Camoufox window survives between calls.
+
+    Closing a context's *last* tab destroys its browser window and every later
+    ``Browser.newPage`` fails (``delayedStartupPromise, window is null``), so
+    the stable plugin profile keeps one idle blank tab alive. Best effort —
+    callers proceed regardless.
+    """
+    try:
+        if client.list_tabs(user_id):
+            return True
+    except CamofoxError:
+        return False
+    try:
+        client.create_tab(user_id)
+        return True
+    except CamofoxError as exc:
+        logger.debug("camofox-search: holder tab for %s failed: %s", user_id, exc)
+        return False
+
+
+def open_page_tab(client: CamofoxClient, user_id: str, url: str) -> str:
+    """Create the work tab for one call, healing a broken context exactly once.
+
+    A context whose window died (keeper reaped, daemon restart) refuses new
+    pages: the session is dropped and rebuilt before the single retry.
+    """
+    ensure_profile_tab(client, user_id)
+    try:
+        return client.create_tab(user_id, url)
+    except CamofoxError:
+        try:
+            client.close_session(user_id)
+        except Exception as exc:  # noqa: BLE001 - healing is best effort
+            logger.debug("camofox-search: context reset for %s failed: %s", user_id, exc)
+        ensure_profile_tab(client, user_id)
+        return client.create_tab(user_id, url)
+
+
 def collect_search_rows(client: CamofoxClient, url: str, expression: str,
-                        limit: int) -> list[dict[str, Any]]:
-    """Open ``url`` in one throwaway session, extract and normalize result rows.
+                        limit: int, *, user_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """Open ``url`` in a fresh tab of the plugin's profile and extract rows.
 
     Shared by :meth:`CamofoxSearchProvider.search` and the
     ``camofox-search-advance`` tool: create tab → wait for readiness → evaluate
     the extraction expression (retrying briefly when the DOM is not populated
-    yet) → normalize into the ``web`` envelope rows. The session is always torn
-    down; ``CamofoxError`` propagates to the caller.
+    yet) → normalize into the ``web`` envelope rows. Only the *tab* is torn
+    down afterwards — the browser context stays warm on the daemon and its
+    persistent profile (``camofox_user_id()``) keeps cookies imported by
+    ``camofox-search-import-cookies``. ``CamofoxError`` propagates to the
+    caller.
     """
-    user_id = client.new_session_id()
+    user_id = user_id or camofox_user_id()
+    tab_id: Optional[str] = None
     try:
-        tab_id = client.create_tab(user_id, url)
+        tab_id = open_page_tab(client, user_id, url)
         _await_ready(client, tab_id, user_id)
         rows: list[dict[str, Any]] = []
         for attempt in range(_SEARCH_EXTRACT_ATTEMPTS):
@@ -176,7 +223,18 @@ def collect_search_rows(client: CamofoxClient, url: str, expression: str,
             time.sleep(_EXTRACT_RETRY_DELAY)
         return rows
     finally:
-        client.close_session(user_id)
+        _close_tab_quietly(client, tab_id, user_id)
+
+
+def _close_tab_quietly(client: CamofoxClient, tab_id: Optional[str],
+                       user_id: str) -> None:
+    """Best-effort tab cleanup — never raises, never masks results."""
+    if not tab_id:
+        return
+    try:
+        client.close_tab(tab_id, user_id)
+    except Exception as exc:  # noqa: BLE001 - deliberate best-effort cleanup
+        logger.debug("Camofox tab cleanup failed for %s: %s", tab_id, exc)
 
 
 def _await_ready(client: CamofoxClient, tab_id: str, user_id: str,
@@ -250,15 +308,16 @@ def _resolve_content_rule(url: str) -> Optional[Rule]:
 # ---- extract helpers ----
 
 def _extract_one(client: CamofoxClient, url: str) -> dict[str, Any]:
-    """Extract readable text from one URL in its own throwaway session.
+    """Extract readable text from one URL in its own tab of the plugin profile.
 
     A content rule for the URL's host supplies the extraction expression; when
     it yields no usable content the generic full-page extraction runs instead.
     ``metadata.extract_rule`` records which path produced the content.
     """
-    user_id = CamofoxClient.new_session_id()
+    user_id = camofox_user_id()
+    tab_id: Optional[str] = None
     try:
-        tab_id = client.create_tab(user_id, url)
+        tab_id = open_page_tab(client, user_id, url)
         _await_ready(client, tab_id, user_id)
         rule = _resolve_content_rule(url)
         if rule is not None:
@@ -292,7 +351,7 @@ def _extract_one(client: CamofoxClient, url: str) -> dict[str, Any]:
     except CamofoxError as exc:
         return {"url": url, "error": str(exc)}
     finally:
-        client.close_session(user_id)
+        _close_tab_quietly(client, tab_id, user_id)
 
 
 def _rule_content_entry(payload: Any, url: str, domain: str) -> Optional[dict[str, Any]]:

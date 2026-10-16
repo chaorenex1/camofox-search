@@ -11,6 +11,9 @@ Also bundled:
   - ``camofox-search-advance`` — advanced search: per-engine SERP URLs with
     operators and time/language/region/vertical/page filters, optionally
     executed through Camofox;
+  - ``camofox-search-import-cookies`` — import cookies from the user's local
+    browser into the plugin's Camofox profile (manual trigger for the
+    scheduled refresh);
 - skills (load as ``web-camofox-search:<name>``):
   - ``camofox-search-rule`` — guidance for managing those rules proactively;
   - ``camofox-search-advance`` — engine catalog and advanced-search workflows.
@@ -22,6 +25,11 @@ import logging
 from pathlib import Path
 
 from .advance import ADVANCE_SCHEMA, TOOL_NAME as ADVANCE_TOOL_NAME, handle_advance
+from .import_cookies import (
+    IMPORT_COOKIES_SCHEMA,
+    TOOL_NAME as IMPORT_COOKIES_TOOL_NAME,
+    handle_import_cookies,
+)
 from .manage import MANAGE_SCHEMA, TOOL_NAME, handle_manage
 from .provider import CamofoxSearchProvider
 
@@ -40,9 +48,13 @@ _ADVANCE_TOOL_DESCRIPTION = (
     "language, region, vertical, pagination) and optionally run them through "
     "the local Camofox browser.")
 
+_IMPORT_COOKIES_TOOL_DESCRIPTION = (
+    "Import cookies from the local browser into the Camofox profile "
+    "camofox-search browses with.")
+
 
 def register(ctx) -> None:
-    """Hermes plugin entry point: provider + rule/advance tools + bundled skills."""
+    """Hermes plugin entry point: provider + tools + bundled skills."""
     ctx.register_web_search_provider(CamofoxSearchProvider())
     _register_tools(ctx)
     _register_skills(ctx)
@@ -52,11 +64,14 @@ def _register_tools(ctx) -> None:
     register_tool = getattr(ctx, "register_tool", None)
     if register_tool is None:  # older Hermes without tool registration
         logger.warning("camofox-search: ctx.register_tool unavailable; "
-                       "%s/%s tools not registered", TOOL_NAME, ADVANCE_TOOL_NAME)
+                       "%s/%s/%s tools not registered", TOOL_NAME,
+                       ADVANCE_TOOL_NAME, IMPORT_COOKIES_TOOL_NAME)
         return
     for name, schema, handler, emoji, description in (
         (TOOL_NAME, MANAGE_SCHEMA, handle_manage, "🔎", _MANAGE_TOOL_DESCRIPTION),
         (ADVANCE_TOOL_NAME, ADVANCE_SCHEMA, handle_advance, "🧭", _ADVANCE_TOOL_DESCRIPTION),
+        (IMPORT_COOKIES_TOOL_NAME, IMPORT_COOKIES_SCHEMA, handle_import_cookies,
+         "🍪", _IMPORT_COOKIES_TOOL_DESCRIPTION),
     ):
         try:
             register_tool(name=name, toolset=TOOL_TOOLSET, schema=schema,

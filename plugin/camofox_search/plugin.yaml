@@ -1,6 +1,6 @@
 name: web-camofox-search
-version: 0.3.0
-description: "Web search and page extraction through a self-hosted Camofox anti-detection browser (Camoufox engine). Search/content rules live in a SQLite database (HERMES_HOME/camofox-search/camofox-search.db, WAL) and are managed by the bundled camofox-search-manage tool and camofox-search-rule skill; the bundled camofox-search-advance tool and skill build per-engine advanced search URLs (site:/filetype:/quotes operators, time/language/region/vertical/pagination filters) and can execute them through the browser. Requires a running camofox-browser server (CAMOFOX_URL, CAMOFOX_API_KEY)."
+version: 0.4.0
+description: "Web search and page extraction through a self-hosted Camofox anti-detection browser (Camoufox engine). Search/content rules live in a SQLite database (HERMES_HOME/camofox-search/camofox-search.db, WAL) and are managed by the bundled camofox-search-manage tool and camofox-search-rule skill; the bundled camofox-search-advance tool and skill build per-engine advanced search URLs (site:/filetype:/quotes operators, time/language/region/vertical/pagination filters) and can execute them through the browser; camofox-search-import-cookies copies cookies from the user's local browser into the plugin's Camofox profile. Requires a running camofox-browser server (CAMOFOX_URL, CAMOFOX_API_KEY)."
 author: chaorenex1
 license: MIT
 kind: backend
@@ -9,6 +9,7 @@ provides_web_providers:
 provides_tools:
   - camofox-search-manage
   - camofox-search-advance
+  - camofox-search-import-cookies
 requires_env:
   - CAMOFOX_URL
   - CAMOFOX_API_KEY

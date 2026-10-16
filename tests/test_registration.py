@@ -6,6 +6,9 @@ from pathlib import Path
 
 from plugin.camofox_search import register
 from plugin.camofox_search.advance import TOOL_NAME as ADVANCE_TOOL_NAME
+from plugin.camofox_search.import_cookies import (
+    TOOL_NAME as IMPORT_COOKIES_TOOL_NAME,
+)
 from plugin.camofox_search.manage import TOOL_NAME
 
 
@@ -43,10 +46,11 @@ def test_register_wires_provider_tools_and_skills():
 
     assert [provider.name for provider in ctx.providers] == ["camofox-search"]
 
-    assert [tool["name"] for tool in ctx.tools] == [TOOL_NAME, ADVANCE_TOOL_NAME]
+    assert [tool["name"] for tool in ctx.tools] == [
+        TOOL_NAME, ADVANCE_TOOL_NAME, IMPORT_COOKIES_TOOL_NAME]
     assert all(tool["toolset"] == "camofox-search" for tool in ctx.tools)
     assert [tool["handler"].__name__ for tool in ctx.tools] == \
-        ["handle_manage", "handle_advance"]
+        ["handle_manage", "handle_advance", "handle_import_cookies"]
 
     assert [skill[0] for skill in ctx.skills] == \
         ["camofox-search-advance", "camofox-search-rule"]

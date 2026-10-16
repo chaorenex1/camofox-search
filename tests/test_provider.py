@@ -22,6 +22,7 @@ class FakeClient:
     create_error = None
     create_error_urls: set[str] = set()
     evaluate_error = None
+    existing_tabs: list = [{"tabId": "holder", "url": "about:blank"}]
 
     def __init__(self, *args, **kwargs):
         self.calls: list[tuple] = []
@@ -32,13 +33,22 @@ class FakeClient:
         FakeClient.session_seq += 1
         return f"cfs_{FakeClient.session_seq}"
 
-    def create_tab(self, user_id, url, session_key="camofox_search"):
+    _next_create_fails = False
+
+    def create_tab(self, user_id, url="", session_key="camofox_search"):
         self.calls.append(("create_tab", user_id, url))
+        if FakeClient._next_create_fails:
+            FakeClient._next_create_fails = False
+            raise CamofoxError("browserContext.newPage: window is null")
         if self.create_error is not None:
             raise self.create_error
         if url in self.create_error_urls:
             raise CamofoxError(f"create failed for {url}")
         return f"tab_{len(FakeClient.instances)}"
+
+    def list_tabs(self, user_id=None):
+        self.calls.append(("list_tabs", user_id))
+        return list(FakeClient.existing_tabs)
 
     def evaluate(self, tab_id, user_id, expression, timeout=None):
         self.calls.append(("evaluate", expression))
@@ -52,7 +62,10 @@ class FakeClient:
             return self.evaluate_queue[0]
         return self.evaluate_result
 
-    def close_session(self, user_id):
+    def close_tab(self, tab_id, user_id):
+        self.calls.append(("close_tab", tab_id, user_id))
+
+    def close_session(self, user_id):  # pragma: no cover - must not be called
         self.calls.append(("close_session", user_id))
 
 
@@ -66,8 +79,11 @@ def fake_client(monkeypatch):
     FakeClient.create_error = None
     FakeClient.create_error_urls = set()
     FakeClient.evaluate_error = None
+    FakeClient.existing_tabs = [{"tabId": "holder", "url": "about:blank"}]
+    FakeClient._next_create_fails = False
     monkeypatch.setattr(provider_module, "CamofoxClient", FakeClient)
     monkeypatch.setattr(provider_module, "default_engine", lambda: "bing")
+    monkeypatch.setattr(provider_module, "camofox_user_id", lambda: "camofox_search")
     return FakeClient
 
 
@@ -124,8 +140,11 @@ def test_search_success_envelope(fake_client, provider):
     client = fake_client.instances[0]
     create = _calls(client, "create_tab")[0]
     assert "bing.com/search?q=hermes+agent" in create[2]
-    assert len(_calls(client, "close_session")) == 1
-    assert _calls(client, "close_session")[0][1] == create[1]
+    # one stable profile: the session/context is NOT torn down, only the tab
+    assert create[1] == "camofox_search"
+    assert len(_calls(client, "close_tab")) == 1
+    assert _calls(client, "close_tab")[0][2] == create[1]
+    assert _calls(client, "close_session") == []
 
 
 def test_search_limit_clamped_and_engine_expression(fake_client, provider):
@@ -168,6 +187,38 @@ def test_search_empty_query(provider):
     assert "Empty search query" in result["error"]
 
 
+def test_search_creates_holder_tab_when_profile_has_no_tabs(fake_client, provider):
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "A", "url": "https://a.example/", "description": "d"}]}
+    fake_client.existing_tabs = []
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    creates = _calls(fake_client.instances[0], "create_tab")
+    # blank holder first (keeps the browser window alive), then the work tab
+    assert [(call[1], call[2]) for call in creates] == [
+        ("camofox_search", ""),
+        ("camofox_search", "https://www.bing.com/search?q=q&count=5")]
+    assert len(_calls(fake_client.instances[0], "close_tab")) == 1
+
+
+def test_search_heals_a_broken_context_once(fake_client, provider):
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "A", "url": "https://a.example/", "description": "d"}]}
+    fake_client._next_create_fails = True  # first work-tab create hits the dead window
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    client = fake_client.instances[0]
+    assert _calls(client, "close_session")  # broken context dropped
+    creates = _calls(client, "create_tab")
+    # work tab (failed) → work tab (retried after the context reset)
+    assert len(creates) == 2
+    assert creates[-1][2].startswith("https://www.bing.com/search")
+
+
 def test_search_connection_error_returns_envelope_and_cleans_up(fake_client, provider):
     fake_client.create_error = CamofoxConnectionError("Cannot reach Camofox at http://x")
 
@@ -175,7 +226,7 @@ def test_search_connection_error_returns_envelope_and_cleans_up(fake_client, pro
 
     assert result["success"] is False
     assert "Cannot reach Camofox" in result["error"]
-    assert len(_calls(fake_client.instances[0], "close_session")) == 1
+    assert _calls(fake_client.instances[0], "close_tab") == []  # no tab existed
 
 
 def test_search_evaluate_error_returns_envelope(fake_client, provider):
@@ -186,7 +237,7 @@ def test_search_evaluate_error_returns_envelope(fake_client, provider):
 
     assert result["success"] is False
     assert "HTTP 409" in result["error"]
-    assert len(_calls(fake_client.instances[0], "close_session")) == 1
+    assert len(_calls(fake_client.instances[0], "close_tab")) == 1
 
 
 def test_search_results_trimmed_to_limit(fake_client, provider):
@@ -219,7 +270,8 @@ def test_extract_success_and_partial_failure(fake_client, provider):
     assert good["metadata"]["final_url"] == "https://final.example/"
     assert "error" in bad and bad["url"] == "https://bad.example/"
     assert len(fake_client.instances) == 1  # one client handles the whole batch
-    assert len(_calls(fake_client.instances[0], "close_session")) == 2  # per-URL sessions
+    # per-URL tabs; the failed create left nothing to close
+    assert len(_calls(fake_client.instances[0], "close_tab")) == 1
 
 
 def test_extract_all_failed_returns_error(fake_client, provider):
@@ -262,7 +314,7 @@ def test_extract_unreadable_page_reports_error(fake_client, provider):
 
     assert result["success"] is False
     assert "could not read page content" in result["error"]
-    assert len(_calls(fake_client.instances[0], "close_session")) == 1
+    assert len(_calls(fake_client.instances[0], "close_tab")) == 1
 
 
 # ---- rule-store integration ----
