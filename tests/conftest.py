@@ -1,4 +1,4 @@
-"""Shared test setup: repo import path + the Hermes provider contract.
+"""Shared test setup: repo import path + the Hermes provider contract + rule-store isolation.
 
 Tests run fully offline. When the real Hermes runtime is importable (running
 under the Hermes venv python) its ABC is used; otherwise a faithful stub of
@@ -6,6 +6,9 @@ under the Hermes venv python) its ABC is used; otherwise a faithful stub of
 be imported and exercised in isolation. The stub mirrors the members the plugin
 touches: ``name``, ``display_name``, ``is_available``, ``supports_*``,
 ``get_setup_schema``.
+
+Every test's rule database is redirected to a temporary directory via
+``CAMOFOX_SEARCH_DATA_DIR`` so no test ever reads or writes a real HERMES_HOME.
 """
 
 from __future__ import annotations
@@ -15,9 +18,19 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_rule_data_dir(tmp_path_factory, monkeypatch):
+    """Point the camofox-search rule store at a per-test temp directory."""
+    data_dir = tmp_path_factory.mktemp("camofox-search-data")
+    monkeypatch.setenv("CAMOFOX_SEARCH_DATA_DIR", str(data_dir))
+    return data_dir
 
 
 class _StubProviderBase:

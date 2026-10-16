@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from plugin.camofox_search import provider as provider_module
+from plugin.camofox_search import rules as rule_store
 from plugin.camofox_search.client import CamofoxConnectionError, CamofoxError
 from plugin.camofox_search.provider import MAX_EXTRACT_URLS, CamofoxSearchProvider
 
@@ -262,3 +263,141 @@ def test_extract_unreadable_page_reports_error(fake_client, provider):
     assert result["success"] is False
     assert "could not read page content" in result["error"]
     assert len(_calls(fake_client.instances[0], "close_session")) == 1
+
+
+# ---- rule-store integration ----
+
+
+def _evaluate_expressions(client):
+    return [call[1] for call in client.calls
+            if call[0] == "evaluate" and "readyState" not in call[1]]
+
+
+def test_search_uses_database_rule(fake_client, provider):
+    rule_store.update_search_rule(
+        "bing.com",
+        url_template="https://serp.example/search?q={query}&n={limit}",
+        extract_js="JSON.stringify({ok:true,results:[{title:'RULED',url:'https://r.example/'}]})",
+        notes="custom bing")
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "RULED", "url": "https://r.example/", "description": "d"}]}
+
+    result = provider.search("rule query", limit=5)
+
+    assert result["success"] is True
+    assert [row["title"] for row in result["data"]["web"]] == ["RULED"]
+    client = fake_client.instances[0]
+    assert _calls(client, "create_tab")[0][2] == \
+        "https://serp.example/search?q=rule+query&n=5"
+    expressions = _evaluate_expressions(client)
+    assert expressions and "RULED" in expressions[0]
+    assert "@LIMIT@" not in expressions[0]  # placeholder substituted before evaluate
+
+
+def test_search_rule_adds_engine_without_builtin_support(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engine", lambda: "yandex")
+    rule_store.create_search_rule(
+        "yandex.com", "https://yandex.example/?text={query}", "JSON.stringify({ok:true,results:[]})")
+    fake_client.evaluate_result = {"ok": True, "results": []}
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    url = _calls(fake_client.instances[0], "create_tab")[0][2]
+    assert url == "https://yandex.example/?text=q"
+
+
+def test_search_falls_back_to_builtin_when_rules_unavailable(fake_client, monkeypatch, provider):
+    def boom(selector):
+        raise RuntimeError("rule database unavailable")
+
+    monkeypatch.setattr(rule_store, "resolve_search_rule", boom)
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "B", "url": "https://b.example/", "description": ""}]}
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    client = fake_client.instances[0]
+    assert "bing.com/search?q=q" in _calls(client, "create_tab")[0][2]
+    assert any("b_algo" in expr for expr in _evaluate_expressions(client))
+
+
+def test_search_unknown_engine_error_mentions_manage_tool(monkeypatch, fake_client, provider):
+    monkeypatch.setattr(provider_module, "default_engine", lambda: "yandex")
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is False
+    assert "Unknown search engine" in result["error"]
+    assert "camofox-search-manage" in result["error"]
+
+
+def test_extract_uses_content_rule(fake_client, provider):
+    rule_js = "/* RULE_MARK */ JSON.stringify({ok:true,title:'CR',url:location.href,text:'rule body'})"
+    rule_store.create_content_rule("good.example", rule_js)
+    fake_client.evaluate_result = {"ok": True, "title": "CR",
+                                   "url": "https://good.example/", "text": "rule body"}
+
+    result = provider.extract(["https://good.example/page"])
+
+    assert result["success"] is True
+    entry = result["data"][0]
+    assert entry["title"] == "CR"
+    assert entry["content"] == "rule body"
+    assert entry["raw_content"] == "rule body"
+    assert entry["metadata"]["extract_rule"] == "good.example"
+    assert _evaluate_expressions(fake_client.instances[0]) == [rule_js]
+
+
+def test_extract_rule_string_result_is_content(fake_client, provider):
+    rule_store.create_content_rule("str.example", "'plain string body'")
+    fake_client.evaluate_result = "plain string body"
+
+    result = provider.extract(["https://str.example/"])
+
+    entry = result["data"][0]
+    assert entry["content"] == "plain string body"
+    assert entry["metadata"]["extract_rule"] == "str.example"
+
+
+def test_extract_content_rule_falls_back_to_default(fake_client, provider):
+    rule_js = "/* RULE_MARK */ 'nothing useful'"
+    rule_store.create_content_rule("good.example", rule_js)
+    fake_client.evaluate_queue = [
+        {"ok": False},
+        {"ok": True, "title": "D", "url": "https://good.example/final", "text": "default body"},
+    ]
+
+    result = provider.extract(["https://good.example/"])
+
+    entry = result["data"][0]
+    assert entry["content"] == "default body"
+    assert entry["metadata"]["extract_rule"] == "default"
+    assert entry["metadata"]["extract_rule_attempted"] == "good.example"
+    expressions = _evaluate_expressions(fake_client.instances[0])
+    assert len(expressions) == 2
+    assert expressions[0] == rule_js
+
+
+def test_extract_default_metadata_without_rule(fake_client, provider):
+    fake_client.evaluate_result = {"ok": True, "title": "T", "url": "u", "text": "x"}
+
+    result = provider.extract(["https://no-rule.example/"])
+
+    metadata = result["data"][0]["metadata"]
+    assert metadata["extract_rule"] == "default"
+    assert "extract_rule_attempted" not in metadata
+
+
+def test_extract_falls_back_when_rule_lookup_fails(fake_client, monkeypatch, provider):
+    def boom(url):
+        raise RuntimeError("rule database unavailable")
+
+    monkeypatch.setattr(rule_store, "resolve_content_rule", boom)
+    fake_client.evaluate_result = {"ok": True, "title": "T", "url": "u", "text": "x"}
+
+    result = provider.extract(["https://a.example/"])
+
+    assert result["success"] is True
+    assert result["data"][0]["content"] == "x"

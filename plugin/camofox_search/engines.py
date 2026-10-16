@@ -1,10 +1,24 @@
-"""Search-engine definitions: query URL builder + page-context extraction JS.
+"""Search-engine definitions: query URL templates + page-context extraction JS.
 
-Each extractor is a single JS expression evaluated in the page context via the
-Camofox ``/evaluate`` endpoint. It returns
-``JSON.stringify({"ok": true, "engine": <name>, "results": [{"title", "url",
-"description"}, ...]})`` so the provider can distinguish "no organic results"
-from "wrong page / blocked / consent wall".
+Engines are plain data — engine domain, a SERP URL template and an extraction
+JS template — so the exact same shape can live in the plugin's rule database
+(:mod:`rules`) and be edited at runtime through the ``camofox-search-manage``
+tool. The built-ins here are both the seed values for that database (inserted
+once, never overwritten) and the fallback used when the rule store is
+unavailable.
+
+Placeholders
+------------
+URL template:
+    ``{query}`` — the search query, URL-encoded via ``quote_plus``;
+    ``{limit}`` — the (clamped) result count.
+Extraction JS (one expression evaluated in the page context):
+    ``@LIMIT@`` — the same clamped result count.
+
+The extraction expression must return
+``JSON.stringify({"ok": true, "results": [{"title", "url", "description"}, ...]})``
+so the provider can distinguish "no organic results" from "wrong page /
+blocked / consent wall".
 
 The Bing extractor is verified against live ``cn.bing.com`` markup
 (``#b_results > li.b_algo`` items with ``h2 a`` links and ``.b_caption p``
@@ -15,7 +29,6 @@ current public markup and use multiple selector fallbacks.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 from urllib.parse import quote_plus
 
 
@@ -23,11 +36,31 @@ class UnknownEngineError(ValueError):
     """The configured engine id is not one this plugin implements."""
 
 
+def render_url_template(template: str, query: str, limit: int) -> str:
+    """Substitute ``{query}`` (URL-encoded) and ``{limit}`` in a URL template."""
+    return (template.replace("{query}", quote_plus(query))
+            .replace("{limit}", str(int(limit))))
+
+
+def render_extract_js(template: str, limit: int) -> str:
+    """Substitute the ``@LIMIT@`` count placeholder in an extraction expression."""
+    return template.replace("@LIMIT@", str(int(limit)))
+
+
 @dataclass(frozen=True)
 class SearchEngine:
+    """A built-in engine: canonical domain + URL and extraction templates."""
+
     name: str
-    build_url: Callable[[str, int], str]
-    extract_js: Callable[[int], str]
+    domain: str
+    url_template: str
+    js_template: str
+
+    def build_url(self, query: str, limit: int) -> str:
+        return render_url_template(self.url_template, query, limit)
+
+    def extract_js(self, limit: int) -> str:
+        return render_extract_js(self.js_template, limit)
 
 
 # ---- Bing (verified live against cn.bing.com) ----
@@ -41,14 +74,6 @@ _BING_JS_TEMPLATE = (
     "description:(p&&p.textContent||'').trim()}})"
     ".filter(function(r){return r.url})})"
 )
-
-
-def _bing_url(query: str, limit: int) -> str:
-    return f"https://www.bing.com/search?q={quote_plus(query)}&count={min(max(limit, 10), 30)}"
-
-
-def _bing_extract(limit: int) -> str:
-    return _BING_JS_TEMPLATE.replace("@LIMIT@", str(int(limit)))
 
 
 # ---- Google (best effort) ----
@@ -66,14 +91,6 @@ _GOOGLE_JS_TEMPLATE = (
 )
 
 
-def _google_url(query: str, limit: int) -> str:
-    return f"https://www.google.com/search?q={quote_plus(query)}&num={max(limit, 10)}"
-
-
-def _google_extract(limit: int) -> str:
-    return _GOOGLE_JS_TEMPLATE.replace("@LIMIT@", str(int(limit)))
-
-
 # ---- DuckDuckGo (best effort) ----
 
 _DDG_JS_TEMPLATE = (
@@ -89,18 +106,19 @@ _DDG_JS_TEMPLATE = (
 )
 
 
-def _duckduckgo_url(query: str, limit: int) -> str:
-    return f"https://duckduckgo.com/?q={quote_plus(query)}&ia=web"
-
-
-def _duckduckgo_extract(limit: int) -> str:
-    return _DDG_JS_TEMPLATE.replace("@LIMIT@", str(int(limit)))
-
-
 ENGINES: dict[str, SearchEngine] = {
-    "bing": SearchEngine("bing", _bing_url, _bing_extract),
-    "google": SearchEngine("google", _google_url, _google_extract),
-    "duckduckgo": SearchEngine("duckduckgo", _duckduckgo_url, _duckduckgo_extract),
+    "bing": SearchEngine(
+        "bing", "bing.com",
+        "https://www.bing.com/search?q={query}&count={limit}",
+        _BING_JS_TEMPLATE),
+    "google": SearchEngine(
+        "google", "google.com",
+        "https://www.google.com/search?q={query}&num={limit}",
+        _GOOGLE_JS_TEMPLATE),
+    "duckduckgo": SearchEngine(
+        "duckduckgo", "duckduckgo.com",
+        "https://duckduckgo.com/?q={query}&ia=web",
+        _DDG_JS_TEMPLATE),
 }
 
 

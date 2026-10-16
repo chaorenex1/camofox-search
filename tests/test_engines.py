@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from plugin.camofox_search.engines import ENGINES, UnknownEngineError, get_engine
+from plugin.camofox_search.engines import (
+    ENGINES,
+    UnknownEngineError,
+    get_engine,
+    render_extract_js,
+    render_url_template,
+)
 
 
 def test_get_engine_is_case_insensitive_and_strips():
@@ -27,18 +33,18 @@ def test_all_engines_have_url_builder_and_extractor():
         assert "slice(0,5)" in js, name
 
 
-def test_bing_url_encodes_query_and_clamps_count():
+def test_bing_url_encodes_query_and_limit():
     engine = get_engine("bing")
     url = engine.build_url("hermes agent", 5)
     assert "bing.com/search?q=hermes+agent" in url
-    assert "count=10" in url  # clamped up to the minimum page size
-    assert "count=30" in engine.build_url("x", 999)  # clamped down
+    assert "count=5" in url
+    assert "count=20" in engine.build_url("x", 20)
 
 
 def test_google_url_encodes_query():
     url = get_engine("google").build_url("café & bar", 5)
     assert "google.com/search?q=caf%C3%A9+%26+bar" in url
-    assert "num=10" in url
+    assert "num=5" in url
 
 
 def test_duckduckgo_url():
@@ -56,3 +62,27 @@ def test_bing_extractor_selectors():
 def test_extractor_limit_is_int_formatted():
     js = get_engine("bing").extract_js(3)
     assert "slice(0,3)" in js
+
+
+def test_engines_expose_domain_and_templates():
+    for name, engine in ENGINES.items():
+        assert engine.domain and "." in engine.domain, name
+        assert "{query}" in engine.url_template, name
+        assert "@LIMIT@" in engine.js_template, name
+        assert engine.name == name
+
+
+def test_render_url_template_encodes_query_and_limit():
+    url = render_url_template(
+        "https://example.com/search?q={query}&n={limit}", "a b&c", 7)
+    assert url == "https://example.com/search?q=a+b%26c&n=7"
+
+
+def test_render_url_template_without_limit_placeholder():
+    url = render_url_template("https://example.com/?q={query}", "x", 5)
+    assert url == "https://example.com/?q=x"
+
+
+def test_render_extract_js_replaces_all_limit_placeholders():
+    js = render_extract_js("slice(0,@LIMIT@)||@LIMIT@", 4)
+    assert js == "slice(0,4)||4"
