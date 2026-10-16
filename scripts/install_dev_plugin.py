@@ -23,8 +23,11 @@ PLUGIN_DESTINATION_RELATIVE = Path("plugins") / "web" / "camofox_search"
 BACKUP_ROOT_RELATIVE = Path("backups") / "plugins" / "web"
 _REQUIRED_PLUGIN_FILES = (
     "__init__.py", "plugin.yaml", "provider.py", "client.py", "engines.py", "settings.py",
-    "rules.py", "manage.py",
+    "rules.py", "manage.py", "advance.py", "advanced.py",
     "skills/camofox-search-rule/SKILL.md",
+    "skills/camofox-search-advance/SKILL.md",
+    "skills/camofox-search-advance/references/engines-cn.md",
+    "skills/camofox-search-advance/references/engines-intl.md",
 )
 _IGNORED_DIRS = {"__pycache__", ".pytest_cache"}
 _IGNORED_SUFFIXES = {".pyc", ".pyo", ".pyd"}

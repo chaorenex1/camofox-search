@@ -112,23 +112,12 @@ class CamofoxSearchProvider(WebSearchProvider):
             return {"success": False, "error": f"{exc}{_RULE_HINT}"}
 
         client = CamofoxClient()
-        user_id = CamofoxClient.new_session_id()
         try:
-            tab_id = client.create_tab(user_id, url)
-            _await_ready(client, tab_id, user_id)
-            rows: list[dict[str, Any]] = []
-            for attempt in range(_SEARCH_EXTRACT_ATTEMPTS):
-                payload = client.evaluate(tab_id, user_id, expression)
-                rows = _result_rows(payload, limit)
-                if rows or attempt == _SEARCH_EXTRACT_ATTEMPTS - 1:
-                    break
-                time.sleep(_EXTRACT_RETRY_DELAY)
+            rows = collect_search_rows(client, url, expression, limit)
             logger.info("camofox-search %r via %s: %d result(s)", query, label, len(rows))
             return {"success": True, "data": {"web": rows}}
         except CamofoxError as exc:
             return {"success": False, "error": str(exc)}
-        finally:
-            client.close_session(user_id)
 
     # ---- extract ----
 
@@ -162,6 +151,32 @@ def _search_plan(selector: str, query: str, limit: int) -> tuple[str, str, str]:
                 f"rule:{rule.domain}")
     engine = get_engine(selector)
     return engine.build_url(query, limit), engine.extract_js(limit), f"engine:{engine.name}"
+
+
+def collect_search_rows(client: CamofoxClient, url: str, expression: str,
+                        limit: int) -> list[dict[str, Any]]:
+    """Open ``url`` in one throwaway session, extract and normalize result rows.
+
+    Shared by :meth:`CamofoxSearchProvider.search` and the
+    ``camofox-search-advance`` tool: create tab → wait for readiness → evaluate
+    the extraction expression (retrying briefly when the DOM is not populated
+    yet) → normalize into the ``web`` envelope rows. The session is always torn
+    down; ``CamofoxError`` propagates to the caller.
+    """
+    user_id = client.new_session_id()
+    try:
+        tab_id = client.create_tab(user_id, url)
+        _await_ready(client, tab_id, user_id)
+        rows: list[dict[str, Any]] = []
+        for attempt in range(_SEARCH_EXTRACT_ATTEMPTS):
+            payload = client.evaluate(tab_id, user_id, expression)
+            rows = _result_rows(payload, limit)
+            if rows or attempt == _SEARCH_EXTRACT_ATTEMPTS - 1:
+                break
+            time.sleep(_EXTRACT_RETRY_DELAY)
+        return rows
+    finally:
+        client.close_session(user_id)
 
 
 def _await_ready(client: CamofoxClient, tab_id: str, user_id: str,

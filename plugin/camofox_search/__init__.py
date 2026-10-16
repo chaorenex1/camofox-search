@@ -5,11 +5,15 @@ Serviced capabilities: ``web_search`` and ``web_extract`` (selected via
 
 Also bundled:
 
-- toolset ``camofox-search`` — the ``camofox-search-manage`` tool for CRUD over
-  the plugin's search/content rule database
-  (``HERMES_HOME/camofox-search/camofox-search.db``);
-- skill ``camofox-search-rule`` (load as ``web-camofox-search:camofox-search-rule``)
-  — guidance for managing those rules proactively.
+- toolset ``camofox-search``:
+  - ``camofox-search-manage`` — CRUD over the plugin's search/content rule
+    database (``HERMES_HOME/camofox-search/camofox-search.db``);
+  - ``camofox-search-advance`` — advanced search: per-engine SERP URLs with
+    operators and time/language/region/vertical/page filters, optionally
+    executed through Camofox;
+- skills (load as ``web-camofox-search:<name>``):
+  - ``camofox-search-rule`` — guidance for managing those rules proactively;
+  - ``camofox-search-advance`` — engine catalog and advanced-search workflows.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from .advance import ADVANCE_SCHEMA, TOOL_NAME as ADVANCE_TOOL_NAME, handle_advance
 from .manage import MANAGE_SCHEMA, TOOL_NAME, handle_manage
 from .provider import CamofoxSearchProvider
 
@@ -26,29 +31,38 @@ __all__ = ["CamofoxSearchProvider", "register"]
 
 TOOL_TOOLSET = "camofox-search"
 
-_TOOL_DESCRIPTION = (
+_MANAGE_TOOL_DESCRIPTION = (
     "Manage camofox-search rules (search engines and page extraction) in the "
     "plugin's SQLite database.")
 
+_ADVANCE_TOOL_DESCRIPTION = (
+    "Advanced camofox-search: build per-engine SERP URLs (operators, time, "
+    "language, region, vertical, pagination) and optionally run them through "
+    "the local Camofox browser.")
+
 
 def register(ctx) -> None:
-    """Hermes plugin entry point: provider + rule tool + bundled skill."""
+    """Hermes plugin entry point: provider + rule/advance tools + bundled skills."""
     ctx.register_web_search_provider(CamofoxSearchProvider())
-    _register_manage_tool(ctx)
+    _register_tools(ctx)
     _register_skills(ctx)
 
 
-def _register_manage_tool(ctx) -> None:
+def _register_tools(ctx) -> None:
     register_tool = getattr(ctx, "register_tool", None)
     if register_tool is None:  # older Hermes without tool registration
         logger.warning("camofox-search: ctx.register_tool unavailable; "
-                       "%s tool not registered", TOOL_NAME)
+                       "%s/%s tools not registered", TOOL_NAME, ADVANCE_TOOL_NAME)
         return
-    try:
-        register_tool(name=TOOL_NAME, toolset=TOOL_TOOLSET, schema=MANAGE_SCHEMA,
-                      handler=handle_manage, emoji="🔎", description=_TOOL_DESCRIPTION)
-    except Exception as exc:  # noqa: BLE001 - never let the tool kill the plugin
-        logger.warning("camofox-search: registering %s failed: %s", TOOL_NAME, exc)
+    for name, schema, handler, emoji, description in (
+        (TOOL_NAME, MANAGE_SCHEMA, handle_manage, "🔎", _MANAGE_TOOL_DESCRIPTION),
+        (ADVANCE_TOOL_NAME, ADVANCE_SCHEMA, handle_advance, "🧭", _ADVANCE_TOOL_DESCRIPTION),
+    ):
+        try:
+            register_tool(name=name, toolset=TOOL_TOOLSET, schema=schema,
+                          handler=handler, emoji=emoji, description=description)
+        except Exception as exc:  # noqa: BLE001 - never let a tool kill the plugin
+            logger.warning("camofox-search: registering %s failed: %s", name, exc)
 
 
 def _register_skills(ctx) -> None:
@@ -63,8 +77,72 @@ def _register_skills(ctx) -> None:
     for child in sorted(skills_dir.iterdir()):
         skill_md = child / "SKILL.md"
         if child.is_dir() and skill_md.exists():
+            description, frontmatter = _skill_metadata(skill_md)
             try:
-                register_skill(child.name, skill_md)
+                register_skill(child.name, skill_md, description=description,
+                               frontmatter=frontmatter)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("camofox-search: registering skill %s failed: %s",
                                child.name, exc)
+
+
+def _skill_metadata(skill_md: Path) -> tuple[str, dict]:
+    """``(description, frontmatter)`` from a bundled SKILL.md.
+
+    Hermes builds a plugin skill's ``<available_skills>`` row from what is
+    passed to ``register_skill`` — the on-disk frontmatter is not re-read for
+    that row — so the description must be handed over at registration time.
+    """
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("camofox-search: cannot read %s: %s", skill_md, exc)
+        return "", {}
+    frontmatter = _parse_frontmatter(text)
+    if not isinstance(frontmatter, dict):
+        return "", {}
+    description = str(frontmatter.get("description") or "").strip()
+    return description, frontmatter
+
+
+def _parse_frontmatter(text: str) -> dict:
+    """Parse the leading YAML frontmatter block of a SKILL.md.
+
+    Dependency-free subset, deliberately avoiding private runtime imports:
+    ``key: value`` pairs (quotes stripped) plus ``key: |`` / ``key: >`` block
+    scalars — the shapes bundled skills use.
+    """
+    lines = text.removeprefix("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fields: dict = {}
+    index = 1
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "---":
+            break
+        key, sep, value = line.partition(":")
+        if not sep or not key.strip():
+            index += 1
+            continue
+        key = key.strip()
+        value = value.strip()
+        if value in ("|", ">", "|-", ">-", "|+", ">+"):
+            block: list[str] = []
+            index += 1
+            while index < len(lines) and (not lines[index].strip()
+                                          or lines[index].startswith((" ", "\t"))):
+                block.append(lines[index].strip())
+                index += 1
+            if value.startswith(">"):
+                fields[key] = " ".join(part for part in block if part)
+            else:
+                while block and not block[-1]:
+                    block.pop()
+                fields[key] = "\n".join(block)
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        fields[key] = value
+        index += 1
+    return fields
