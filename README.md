@@ -140,9 +140,14 @@ extractions carry the user's logins / consent / clearance cookies.
   export. Only counts and skip reasons are returned — never cookie values.
 - Sources and limits: Chromium cookies are AES-256-GCM values under a
   DPAPI-protected key in `Local State` (current builds add a 32-byte binding
-  prefix that is stripped; app-bound `v20` values are skipped); Firefox
-  `cookies.sqlite` is plaintext. A *running* Chromium-family browser locks its
-  cookie DB — the tool then falls back to a CDP export on
+  prefix that is stripped). App-bound `v20` values (modern Edge/Chrome) export
+  through the optional [`rookie-cookies`](https://github.com/teng-lin/rookie-cookies)
+  package (`pip install rookie-cookies`, or the `abe` extra): it recovers the
+  app-bound key inside a browser process it spawns — the target browser must
+  be closed; no elevation needed. `CAMOFOX_SEARCH_COOKIE_APP_BOUND=disabled`
+  skips v20 rows instead of injecting. Without the package those rows are
+  skipped. Firefox `cookies.sqlite` is plaintext. A *running* Chromium-family
+  browser locks its cookie DB — the tool then falls back to a CDP export on
   `127.0.0.1:9222` (override `CAMOFOX_SEARCH_CDP_PORTS`) when a browser with
   `--remote-debugging-port` is reachable, and otherwise reports exactly what
   to close or re-run.

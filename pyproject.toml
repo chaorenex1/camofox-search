@@ -16,6 +16,10 @@ dependencies = [
 test = [
     "pytest>=8",
 ]
+# App-Bound (v20) Chromium cookie export (modern Edge/Chrome on Windows).
+abe = [
+    "rookie-cookies>=0.6",
+]
 
 # Pip distribution path for the same plugin the copy installer deploys.
 # The entry point name matches the plugin manifest name so both install

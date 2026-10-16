@@ -11,10 +11,12 @@ Supported sources (Windows-first; the plugin only automates Windows paths):
   AES-256-GCM encrypted with a key that is itself DPAPI-protected in
   ``Local State`` (``os_crypt.encrypted_key``); current builds (verified on
   Edge 155) additionally prefix the plaintext with 32 bytes of binding data,
-  which the exporter strips. App-bound values (``v20``) cannot be decrypted
-  from outside the browser and are skipped, as are values that fail to
-  unprotect. Requires the ``cryptography`` package for the AES-GCM path
-  (present in every Hermes runtime).
+  which the exporter strips. App-bound values (``v20``) export through the
+  optional ``rookie-cookies`` package, which recovers the app-bound key
+  inside a browser process it spawns — the target browser must be closed, no
+  elevation needed; without the package those rows are skipped, as are values
+  that fail to unprotect. Requires the ``cryptography`` package for the
+  built-in AES-GCM path (present in every Hermes runtime).
 - Firefox — ``cookies.sqlite`` (``moz_cookies``) stores plaintext values.
 
 The database file is copied (with its WAL/SHM siblings) before reading, so a
@@ -37,7 +39,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +48,11 @@ __all__ = [
     "CookieSourceLockedError", "CdpError",
     "detect_browsers", "export_cookies", "export_via_cdp", "import_cookies",
     "cdp_reachable", "cdp_page_ws_url", "cdp_command", "cdp_ports",
-    "BROWSER_IDS", "MAX_COOKIES_PER_REQUEST",
+    "BROWSER_IDS", "MAX_COOKIES_PER_REQUEST", "MAX_BATCH_BYTES",
 ]
 
 MAX_COOKIES_PER_REQUEST = 500  # camofox-browser caps one import POST at 500
+MAX_BATCH_BYTES = 64 * 1024  # ... and 413s bodies over ~100 KB: stay well under
 _UNIX_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
 
 BROWSER_IDS = ("chrome", "edge", "brave", "chromium", "vivaldi", "firefox")
@@ -498,9 +501,131 @@ def _drop_duplicates(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(seen.values())
 
 
+# ---- Chromium export via rookie-cookies (optional) -----------------------
+
+
+def _load_rookie():
+    """The optional ``rookie_cookies`` module, or ``None`` when not installed.
+
+    rookie-cookies lifts the App-Bound (``v20``) blocker: with the browser
+    closed it spawns a browser process it controls and recovers the app-bound
+    key inside it — no elevation, no debug-port launch. Kept as a distinct
+    seam so tests never reach a real browser store through it.
+    """
+    try:
+        import rookie_cookies  # type: ignore[import-not-found]
+        return rookie_cookies
+    except Exception as exc:  # noqa: BLE001 - optional dependency, never fatal
+        logger.debug("camofox-search: rookie-cookies unavailable: %s", exc)
+        return None
+
+
+def _app_bound_policy() -> str:
+    """Windows App-Bound ``v20`` recovery policy for rookie-cookies reads.
+
+    ``CAMOFOX_SEARCH_COOKIE_APP_BOUND``: ``injection_only`` (default) spawns
+    and injects into a browser process it controls; ``disabled`` leaves v20
+    rows unreadable (nothing for protection software to flag);
+    ``allow_elevated_fallback`` additionally permits SYSTEM impersonation.
+    """
+    value = (os.environ.get("CAMOFOX_SEARCH_COOKIE_APP_BOUND", "") or "").strip().lower()
+    if value in ("disabled", "injection_only", "allow_elevated_fallback"):
+        return value
+    return "injection_only"
+
+
+_ROOKIE_SAME_SITE = {0: "None", 1: "Lax", 2: "Strict"}  # Chromium samesite enum
+
+
+def _export_cookies_rookie(rookie: Any, profile: BrowserProfile, *,
+                           domains: Optional[Iterable[str]] = None) -> ExportResult:
+    """Export a Chromium profile through rookie-cookies.
+
+    Rows are read with ``include_expired=True`` so expired/duplicate/filter
+    accounting matches the built-in sqlite path; rows rookie-cookies could not
+    unseal arrive as snapshot warnings and count as ``undecryptable``. A
+    locked database surfaces as rookie's own error — :func:`export_cookies`
+    then falls back to the sqlite path, which re-raises the canonical
+    :class:`CookieSourceLockedError` with the CDP-fallback hint.
+    """
+    snapshot = rookie.read(browser=profile.browser, profile=profile.name,
+                          include_expired=True,
+                          app_bound=_app_bound_policy())
+    rows = snapshot.as_list()
+    skipped = sum(int(getattr(w, "count", 0) or 0) for w in (snapshot.warnings or []))
+    stats = {"rows": len(rows) + skipped, "exported": 0, "expired": 0,
+             "filtered": 0, "undecryptable": skipped, "duplicates": 0,
+             "key_error": 0}
+    suffixes = [d.strip().lower().lstrip(".") for d in (domains or []) if str(d).strip()]
+    now = time.time()
+    cookies: list[dict[str, Any]] = []
+    for row in rows:
+        domain = str(row.get("domain") or "")
+        name = str(row.get("name") or "")
+        if suffixes and not any(domain.lower().lstrip(".").endswith(s) for s in suffixes):
+            stats["filtered"] += 1
+            continue
+        raw_expires = row.get("expires")
+        try:
+            expires = int(raw_expires) if raw_expires is not None else -1
+        except (TypeError, ValueError):
+            expires = -1
+        if expires <= 0:
+            expires = -1
+        elif expires < now:
+            stats["expired"] += 1
+            continue
+        if not name or not domain:
+            stats["filtered"] += 1
+            continue
+        cookie: dict[str, Any] = {
+            "name": name, "value": str(row.get("value") or ""), "domain": domain,
+            "path": str(row.get("path") or "/"), "expires": expires,
+            "httpOnly": bool(row.get("http_only")), "secure": bool(row.get("secure")),
+        }
+        same_site = _ROOKIE_SAME_SITE.get(row.get("same_site"))
+        if same_site and not (same_site == "None" and not cookie["secure"]):
+            # Playwright/Chromium reject SameSite=None without Secure.
+            cookie["sameSite"] = same_site
+        cookies.append(cookie)
+    before = len(cookies)
+    cookies = _drop_duplicates(cookies)
+    stats["duplicates"] = before - len(cookies)
+    stats["exported"] = len(cookies)
+    return ExportResult(profile=profile, cookies=cookies, stats=stats)
+
+
 def export_cookies(profile: BrowserProfile, *,
                    domains: Optional[Iterable[str]] = None) -> ExportResult:
     """Export and decrypt one profile's cookies (value-free stats in ``stats``).
+
+    Chromium exports prefer the optional ``rookie-cookies`` package when it is
+    installed — it handles ``v10`` the same way and additionally unseals
+    App-Bound ``v20`` values with the browser closed. Any rookie failure falls
+    back to the built-in DPAPI path below, whose locked-database error the CDP
+    fallback chain already handles.
+
+    ``domains`` filters by suffix (``"zhihu.com"`` also matches
+    ``www.zhihu.com``). Expired cookies, duplicates, undecryptable values and
+    rows outside the filter are counted in ``stats``; cookie *values* are
+    never logged.
+    """
+    if profile.family == "chromium":
+        rookie = _load_rookie()
+        if rookie is not None:
+            try:
+                return _export_cookies_rookie(rookie, profile, domains=domains)
+            except Exception as exc:  # noqa: BLE001 - fall back to the built-in path
+                logger.warning(
+                    "camofox-search: rookie-cookies export failed for %s/%s "
+                    "(%s); falling back to the built-in DPAPI path",
+                    profile.browser, profile.name, exc)
+    return _export_cookies_sqlite(profile, domains=domains)
+
+
+def _export_cookies_sqlite(profile: BrowserProfile, *,
+                           domains: Optional[Iterable[str]] = None) -> ExportResult:
+    """Built-in sqlite + DPAPI export (``v10`` decrypts; ``v20`` skipped).
 
     ``domains`` filters by suffix (``"zhihu.com"`` also matches
     ``www.zhihu.com``). Expired cookies, duplicates, undecryptable values and
@@ -590,17 +715,40 @@ def export_cookies(profile: BrowserProfile, *,
 # ---- import into camofox-browser -----------------------------------------
 
 
+def _batched(cookies: list[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
+    """Split cookies into daemon-acceptable batches.
+
+    Count cap: 500 cookies per request. Byte cap: the daemon answers HTTP 413
+    for request bodies over ~100 KB (an express json limit), so every batch's
+    wire size is kept under :data:`MAX_BATCH_BYTES` using the same
+    ``ensure_ascii`` encoding ``requests`` will send. A single oversized
+    cookie still goes out alone (a batch is never dropped).
+    """
+    batch: list[dict[str, Any]] = []
+    size = 2  # the "[]" array wrapper
+    for cookie in cookies:
+        cost = len(json.dumps(cookie, ensure_ascii=True).encode("utf-8")) + 1
+        if batch and (len(batch) + 1 > MAX_COOKIES_PER_REQUEST
+                      or size + cost > MAX_BATCH_BYTES):
+            yield batch
+            batch, size = [], 2
+        batch.append(cookie)
+        size += cost
+    if batch:
+        yield batch
+
+
 def import_cookies(client: Any, user_id: str, cookies: list[dict[str, Any]],
                    *, tab_id: Optional[str] = None) -> ImportResult:
     """Push cookies into the camofox profile for ``user_id``, batched.
 
-    The daemon caps one request at 500 cookies, so the set is split; every
+    The daemon caps one request at 500 cookies and rejects bodies over
+    ~100 KB (HTTP 413), so the set is split by count and byte size; every
     batch targets the same tab (``tab_id``) to keep the import unambiguous
     when other sessions exist. Returns sent/batch counts (no values).
     """
     result = ImportResult()
-    for start in range(0, len(cookies), MAX_COOKIES_PER_REQUEST):
-        batch = cookies[start:start + MAX_COOKIES_PER_REQUEST]
+    for batch in _batched(cookies):
         response = client.set_cookies(user_id, batch, tab_id=tab_id)
         result.batches += 1
         result.sent += len(batch)

@@ -67,6 +67,17 @@ def _make_chromium_profile(root: Path, rows: list[tuple],
                           last_modified=db.stat().st_mtime)
 
 
+@pytest.fixture(autouse=True)
+def _rookie_opt_out(monkeypatch):
+    """Default every test to the built-in sqlite path (no real rookie reads).
+
+    Tests that exercise the rookie path re-patch ``_load_rookie`` afterwards;
+    without this default, a locally installed rookie-cookies would reach the
+    REAL browser stores on this machine.
+    """
+    monkeypatch.setattr(cookies_module, "_load_rookie", lambda: None)
+
+
 # ---- detection -----------------------------------------------------------
 
 
@@ -188,6 +199,129 @@ def test_export_chromium_key_error_is_counted(tmp_path, monkeypatch):
     assert result.stats["key_error"] == 1
 
 
+# ---- chromium export via rookie-cookies -----------------------------------
+
+
+class _FakeWarning:
+    def __init__(self, code: str, count: int):
+        self.code = code
+        self.count = count
+
+
+class _FakeSnapshot:
+    def __init__(self, rows: list[dict], warnings: list | None = None):
+        self._rows = rows
+        self.warnings = warnings or []
+
+    def as_list(self) -> list[dict]:
+        return list(self._rows)
+
+
+class _FakeRookie:
+    """Pipe double for the rookie_cookies module (never touches a browser)."""
+
+    def __init__(self, rows: list[dict], warnings: list | None = None,
+                 error: Exception | None = None):
+        self.rows = rows
+        self.warnings = warnings
+        self.error = error
+        self.calls: list[dict] = []
+
+    def read(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return _FakeSnapshot(self.rows, self.warnings)
+
+
+def _rookie_row(domain: str = ".example.com", name: str = "good",
+                value: str = "secret", path: str = "/", expires=None,
+                secure: bool = True, http_only: bool = True,
+                same_site: int = 1) -> dict:
+    return {"domain": domain, "name": name, "value": value, "path": path,
+            "expires": expires, "secure": secure, "http_only": http_only,
+            "same_site": same_site}
+
+
+def test_export_chromium_uses_rookie_and_maps_rows(tmp_path, monkeypatch):
+    now = int(time.time())
+    fake = _FakeRookie(rows=[
+        _rookie_row(expires=now + 3600),                                   # keep
+        _rookie_row(expires=now + 3600),                                   # duplicate
+        _rookie_row(name="session", expires=None, same_site=-1,
+                    secure=False, http_only=False),                        # keep, session
+        _rookie_row(name="note", same_site=0, secure=False),               # keep; None + insecure → sameSite dropped
+        _rookie_row(name="old", expires=now - 100),                        # expired
+        _rookie_row(name="other", domain=".other.org", expires=now + 60),  # keep
+    ], warnings=[_FakeWarning("invalid_octets", 2)])
+    monkeypatch.setattr(cookies_module, "_load_rookie", lambda: fake)
+    profile = _make_chromium_profile(tmp_path, [])
+
+    result = export_cookies(profile)
+
+    by_name = {c["name"]: c for c in result.cookies}
+    assert set(by_name) == {"good", "session", "note", "other"}
+    assert by_name["good"]["value"] == "secret"
+    assert by_name["good"]["httpOnly"] is True
+    assert by_name["good"]["sameSite"] == "Lax"
+    assert by_name["session"]["expires"] == -1  # None → session cookie
+    assert "sameSite" not in by_name["session"]  # unspecified (enum -1) → no attribute
+    assert "sameSite" not in by_name["note"]  # None + insecure → attribute dropped
+    assert result.stats == {"rows": 8, "exported": 4, "expired": 1,
+                            "filtered": 0, "undecryptable": 2,
+                            "duplicates": 1, "key_error": 0}
+    call = fake.calls[0]
+    assert call["browser"] == "edge" and call["profile"] == "Default"
+    assert call["include_expired"] is True
+    assert call["app_bound"] == "injection_only"
+
+    filtered = export_cookies(profile, domains=["other.org"])
+    assert [c["name"] for c in filtered.cookies] == ["other"]
+    assert filtered.stats["filtered"] == 5  # every non-matching row, incl. duplicate and expired
+
+
+def test_export_chromium_rookie_failure_falls_back_to_sqlite(tmp_path, monkeypatch):
+    _aesgcm()
+    now = int(time.time())
+    micros = lambda seconds: (seconds + 11644473600) * 1_000_000  # noqa: E731
+    profile = _make_chromium_profile(tmp_path, [
+        (".example.com", "good", _encrypt_v10(KEY, "secret"), "/",
+         micros(now + 3600), 1, 1, 1)])
+    fake = _FakeRookie(rows=[], error=RuntimeError("share-locked (os error 32)"))
+    monkeypatch.setattr(cookies_module, "_load_rookie", lambda: fake)
+    monkeypatch.setattr(cookies_module, "load_chromium_key", lambda _dir: KEY)
+
+    result = export_cookies(profile)
+
+    assert fake.calls  # the rookie attempt happened before the fallback
+    assert [c["name"] for c in result.cookies] == ["good"]
+    assert result.cookies[0]["value"] == "secret"
+    assert result.stats["exported"] == 1 and result.stats["key_error"] == 0
+
+
+def test_export_firefox_never_uses_rookie(tmp_path, monkeypatch):
+    fake = _FakeRookie(rows=[])
+    monkeypatch.setattr(cookies_module, "_load_rookie", lambda: fake)
+    profile = _make_firefox_profile(tmp_path, [
+        (".example.com", "a", "v", "/", 0, 0, 0, 0)])
+
+    result = export_cookies(profile)
+
+    assert fake.calls == []
+    assert result.stats["exported"] == 1
+
+
+def test_app_bound_policy_env(monkeypatch):
+    monkeypatch.delenv("CAMOFOX_SEARCH_COOKIE_APP_BOUND", raising=False)
+    assert cookies_module._app_bound_policy() == "injection_only"
+    monkeypatch.setenv("CAMOFOX_SEARCH_COOKIE_APP_BOUND", "disabled")
+    assert cookies_module._app_bound_policy() == "disabled"
+    monkeypatch.setenv("CAMOFOX_SEARCH_COOKIE_APP_BOUND", "allow_elevated_fallback")
+    assert cookies_module._app_bound_policy() == "allow_elevated_fallback"
+    monkeypatch.setenv("CAMOFOX_SEARCH_COOKIE_APP_BOUND", "bogus")
+    assert cookies_module._app_bound_policy() == "injection_only"
+
+
 def test_decrypt_strips_32_byte_binding_prefix():
     _aesgcm()
     AESGCM = _aesgcm().AESGCM
@@ -289,9 +423,11 @@ def test_export_via_cdp_without_endpoint_raises(monkeypatch):
 class FakeClient:
     def __init__(self):
         self.calls: list[tuple] = []
+        self.batch_payloads: list[list[dict]] = []
 
     def set_cookies(self, user_id, cookies, tab_id=None):
         self.calls.append(("set_cookies", user_id, len(cookies), tab_id))
+        self.batch_payloads.append(list(cookies))
         return {"ok": True, "userId": user_id, "count": len(cookies)}
 
 
@@ -311,6 +447,24 @@ def test_import_cookies_batches_at_500_and_reports_counts():
     assert result.accepted == 1201
     assert result.to_dict() == {"sent": 1201, "accepted": 1201, "batches": 3,
                                 "present_after": None}
+
+
+def test_import_cookies_splits_batches_by_payload_bytes():
+    """Long values must split below the count cap: the daemon 413s >100 KB."""
+    client = FakeClient()
+    cookies = [{"name": f"c{i}", "value": "x" * 400, "domain": "example.com",
+                "path": "/", "expires": -1, "httpOnly": False, "secure": True}
+               for i in range(300)]
+
+    result = import_cookies(client, "u", cookies)
+
+    counts = [call[2] for call in client.calls]
+    assert result.sent == 300
+    assert len(counts) > 1  # byte cap forces more than one batch
+    assert max(counts) <= cookies_module.MAX_COOKIES_PER_REQUEST
+    for batch in client.batch_payloads:
+        wire = len(json.dumps(batch, ensure_ascii=True).encode("utf-8"))
+        assert wire <= cookies_module.MAX_BATCH_BYTES
 
 
 def test_import_cookies_tolerates_response_without_count():
