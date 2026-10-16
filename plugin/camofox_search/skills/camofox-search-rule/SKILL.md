@@ -44,9 +44,10 @@ Look at the current state first:
 - `content_rules` (content rules): `domain` (content-page domain, e.g.
   `zhihu.com`), `extract_js`.
 
-The built-in engines (bing / google / duckduckgo) are seeded into `search_rules`
-the first time the database is created and are never overwritten afterwards —
-edit or delete them like any other rule.
+The built-in engines (bing / google / duckduckgo) are created and seeded into
+`search_rules` at plugin startup (`INSERT OR IGNORE` — an existing rule is
+never overwritten; if a seed rule was deleted it comes back on the next
+startup). Edit them like any other rule.
 
 ## Tool: camofox-search-manage
 
@@ -82,11 +83,15 @@ the fields you pass change. `create` fails when the domain already exists —
   It must return
   `JSON.stringify({ok:true,results:[{title,url,description},...]})`. Entries
   without a URL are dropped; the first `@LIMIT@` entries are kept, in order.
-- Engine selection: `CAMOFOX_SEARCH_ENGINE` (default `bing`) matches rules **by
-  domain** — `bing`, `bing.com`, and `cn.bing.com` all resolve to the
-  `bing.com` rule (longest domain wins). Adding an engine = create a rule +
-  point `CAMOFOX_SEARCH_ENGINE` at its domain.
-- When no rule matches, the built-in engines are the fallback.
+- Engine selection: `CAMOFOX_SEARCH_ENGINE` holds a whitespace/comma-separated
+  **list** of engine ids or domains (default `duckduckgo google bing`). Each
+  entry matches rules **by domain** — `bing`, `bing.com`, and `cn.bing.com` all
+  resolve to the `bing.com` rule (longest domain wins). Every configured engine
+  is searched in parallel and the results are merged (duplicates collapsed by
+  URL hash, engines interleaved by rank). Adding an engine = create a rule +
+  add its id/domain to `CAMOFOX_SEARCH_ENGINE`.
+- When no rule matches, the built-in engines are the fallback; a configured
+  engine entry that matches neither is skipped (the other engines still run).
 
 ## Content rule contract
 

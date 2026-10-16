@@ -19,6 +19,7 @@ class FakeClient:
     ready_state = "complete"
     evaluate_result = None
     evaluate_queue: list = []
+    results_by_url: dict = {}  # URL substring of the tab -> canned payload
     create_error = None
     create_error_urls: set[str] = set()
     evaluate_error = None
@@ -26,6 +27,7 @@ class FakeClient:
 
     def __init__(self, *args, **kwargs):
         self.calls: list[tuple] = []
+        self.tab_urls: dict[str, str] = {}
         FakeClient.instances.append(self)
 
     @staticmethod
@@ -44,7 +46,9 @@ class FakeClient:
             raise self.create_error
         if url in self.create_error_urls:
             raise CamofoxError(f"create failed for {url}")
-        return f"tab_{len(FakeClient.instances)}"
+        tab_id = f"tab_{len(FakeClient.instances)}_{len(self.calls)}"
+        self.tab_urls[tab_id] = url
+        return tab_id
 
     def list_tabs(self, user_id=None):
         self.calls.append(("list_tabs", user_id))
@@ -56,6 +60,10 @@ class FakeClient:
             return self.ready_state
         if self.evaluate_error is not None:
             raise self.evaluate_error
+        tab_url = self.tab_urls.get(tab_id, "")
+        for marker, payload in FakeClient.results_by_url.items():
+            if marker and marker in tab_url:
+                return payload
         if self.evaluate_queue:
             if len(self.evaluate_queue) > 1:
                 return self.evaluate_queue.pop(0)
@@ -76,13 +84,14 @@ def fake_client(monkeypatch):
     FakeClient.ready_state = "complete"
     FakeClient.evaluate_result = None
     FakeClient.evaluate_queue = []
+    FakeClient.results_by_url = {}
     FakeClient.create_error = None
     FakeClient.create_error_urls = set()
     FakeClient.evaluate_error = None
     FakeClient.existing_tabs = [{"tabId": "holder", "url": "about:blank"}]
     FakeClient._next_create_fails = False
     monkeypatch.setattr(provider_module, "CamofoxClient", FakeClient)
-    monkeypatch.setattr(provider_module, "default_engine", lambda: "bing")
+    monkeypatch.setattr(provider_module, "default_engines", lambda: ["bing"])
     monkeypatch.setattr(provider_module, "camofox_user_id", lambda: "camofox_search")
     return FakeClient
 
@@ -175,7 +184,7 @@ def test_search_empty_results_retries_then_succeeds(fake_client, provider):
 
 
 def test_search_unknown_engine(monkeypatch, fake_client, provider):
-    monkeypatch.setattr(provider_module, "default_engine", lambda: "yandex")
+    monkeypatch.setattr(provider_module, "default_engines", lambda: ["yandex"])
     result = provider.search("q", limit=5)
     assert result["success"] is False
     assert "Unknown search engine" in result["error"]
@@ -248,6 +257,165 @@ def test_search_results_trimmed_to_limit(fake_client, provider):
     result = provider.search("q", limit=3)
     assert len(result["data"]["web"]) == 3
     assert [row["position"] for row in result["data"]["web"]] == [1, 2, 3]
+
+
+# ---- multi-engine search (parallel fan-out + hash merge) ----
+
+
+def test_search_fans_out_to_all_configured_engines_and_merges(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engines",
+                        lambda: ["duckduckgo", "google", "bing"])
+    fake_client.results_by_url = {
+        "duckduckgo.com": {"ok": True, "results": [
+            {"title": "D1", "url": "https://d1.example/", "description": "dd"},
+            {"title": "Shared", "url": "https://shared.example/page/",
+             "description": "from ddg"}]},
+        "google.com": {"ok": True, "results": [
+            {"title": "G1", "url": "https://g1.example/", "description": "gg"},
+            {"title": "Shared again", "url": "https://www.shared.example/page",
+             "description": "from google"}]},
+        "bing.com": {"ok": True, "results": [
+            {"title": "B1", "url": "https://b1.example/", "description": "bb"}]},
+    }
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    assert len(fake_client.instances) == 1  # one client handles every engine
+    client = fake_client.instances[0]
+    creates = [call[2] for call in _calls(client, "create_tab")]
+    assert any("duckduckgo.com/?q=q" in url for url in creates)
+    assert any("google.com/search?q=q" in url for url in creates)
+    assert any("bing.com/search?q=q" in url for url in creates)
+
+    rows = result["data"]["web"]
+    urls = [row["url"] for row in rows]
+    # the shared page (www./trailing-slash variants) merges into one row
+    assert sum(1 for url in urls if "shared.example" in url) == 1
+    assert set(urls) == {"https://d1.example/", "https://shared.example/page/",
+                         "https://g1.example/", "https://b1.example/"}
+    # rank-interleaved: every engine's #1 first, then the next ranks
+    assert urls == ["https://d1.example/", "https://g1.example/", "https://b1.example/",
+                    "https://shared.example/page/"]
+    assert [row["position"] for row in rows] == [1, 2, 3, 4]
+    assert len(_calls(client, "close_tab")) == 3  # every engine's tab was closed
+
+
+def test_search_merge_fills_empty_fields_from_duplicate(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engines",
+                        lambda: ["duckduckgo", "google"])
+    fake_client.results_by_url = {
+        "duckduckgo.com": {"ok": True, "results": [
+            {"title": "", "url": "https://x.example/a", "description": ""}]},
+        "google.com": {"ok": True, "results": [
+            {"title": "T", "url": "https://x.example/a/", "description": "filled"}]},
+    }
+
+    rows = provider.search("q", limit=5)["data"]["web"]
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "T"
+    assert rows[0]["description"] == "filled"
+
+
+def test_search_partial_engine_failure_returns_healthy_results(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engines",
+                        lambda: ["duckduckgo", "google"])
+    fake_client.results_by_url = {
+        "duckduckgo.com": {"ok": True, "results": [
+            {"title": "D1", "url": "https://d1.example/", "description": "d"}]},
+    }
+    fake_client.create_error_urls = {"https://www.google.com/search?q=q&num=5"}
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    assert [row["url"] for row in result["data"]["web"]] == ["https://d1.example/"]
+
+
+def test_search_all_engines_failed_returns_error(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engines",
+                        lambda: ["duckduckgo", "google"])
+    fake_client.create_error = CamofoxError("daemon down")
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is False
+    assert "daemon down" in result["error"]
+
+
+def test_search_skips_unknown_engine_when_others_resolve(fake_client, monkeypatch, provider):
+    monkeypatch.setattr(provider_module, "default_engines", lambda: ["yandex", "bing"])
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "B", "url": "https://b.example/", "description": "d"}]}
+
+    result = provider.search("q", limit=5)
+
+    assert result["success"] is True
+    assert [row["url"] for row in result["data"]["web"]] == ["https://b.example/"]
+    creates = [call[2] for call in _calls(fake_client.instances[0], "create_tab")]
+    assert creates and all("bing.com" in url for url in creates)
+
+
+def test_search_workers_inherit_caller_contextvars(fake_client, monkeypatch, provider):
+    """Regression: parallel workers must run in a copy of the caller's context.
+
+    Hermes' per-turn secret scope is a ``ContextVar`` that fresh threads do
+    not inherit; a worker without the context copy fails closed
+    (``UnscopedSecretError``) on the multiplexed gateway while reading the
+    plugin's env vars.
+    """
+    import contextvars
+
+    marker = contextvars.ContextVar("camofox_test_scope", default=None)
+    seen: list = []
+    original = provider_module.collect_search_rows
+
+    def probe(client, url, expression, limit, *, user_id=None):
+        seen.append(marker.get())
+        return original(client, url, expression, limit)
+
+    monkeypatch.setattr(provider_module, "collect_search_rows", probe)
+    monkeypatch.setattr(provider_module, "default_engines",
+                        lambda: ["duckduckgo", "google"])
+    fake_client.evaluate_result = {"ok": True, "results": [
+        {"title": "T", "url": "https://t.example/", "description": ""}]}
+
+    token = marker.set("turn-scope")
+    try:
+        result = provider.search("q", limit=5)
+    finally:
+        marker.reset(token)
+
+    assert result["success"] is True
+    assert seen == ["turn-scope", "turn-scope"]
+
+
+def test_url_hash_normalizes_cross_engine_variants():
+    url_hash = provider_module.url_hash
+    assert url_hash("https://www.Example.com/a/") == url_hash("http://example.com/a")
+    assert url_hash("https://example.com/a#frag") == url_hash("https://example.com/a")
+    assert url_hash("https://example.com:443/a") == url_hash("https://example.com/a")
+    assert url_hash("https://example.com/a") != url_hash("https://example.com/b")
+    assert url_hash("https://example.com/a?x=1") != url_hash("https://example.com/a")
+
+
+def test_merge_search_rows_interleaves_caps_and_renumbers():
+    rows_a = [{"title": f"a{i}", "url": f"https://a.example/{i}",
+               "description": "", "position": i + 1} for i in range(5)]
+    rows_b = [{"title": f"b{i}", "url": f"https://b.example/{i}",
+               "description": "", "position": i + 1} for i in range(5)]
+
+    merged = provider_module.merge_search_rows([rows_a, rows_b], cap=7)
+
+    assert len(merged) == 7
+    assert [row["position"] for row in merged] == list(range(1, 8))
+    assert [row["url"] for row in merged] == [
+        "https://a.example/0", "https://b.example/0",
+        "https://a.example/1", "https://b.example/1",
+        "https://a.example/2", "https://b.example/2",
+        "https://a.example/3"]
+    assert provider_module.merge_search_rows([], cap=5) == []
 
 
 # ---- extract ----
@@ -347,7 +515,7 @@ def test_search_uses_database_rule(fake_client, provider):
 
 
 def test_search_rule_adds_engine_without_builtin_support(fake_client, monkeypatch, provider):
-    monkeypatch.setattr(provider_module, "default_engine", lambda: "yandex")
+    monkeypatch.setattr(provider_module, "default_engines", lambda: ["yandex"])
     rule_store.create_search_rule(
         "yandex.com", "https://yandex.example/?text={query}", "JSON.stringify({ok:true,results:[]})")
     fake_client.evaluate_result = {"ok": True, "results": []}
@@ -376,7 +544,7 @@ def test_search_falls_back_to_builtin_when_rules_unavailable(fake_client, monkey
 
 
 def test_search_unknown_engine_error_mentions_manage_tool(monkeypatch, fake_client, provider):
-    monkeypatch.setattr(provider_module, "default_engine", lambda: "yandex")
+    monkeypatch.setattr(provider_module, "default_engines", lambda: ["yandex"])
 
     result = provider.search("q", limit=5)
 

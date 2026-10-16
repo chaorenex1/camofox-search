@@ -9,12 +9,16 @@ every search/extraction, while the daemon's own lifecycle still reclaims idle
 contexts. Plugin activity never leaks into the browser sessions Hermes' own
 ``browser_*`` tools own.
 
-Engine selection is rule-driven: the rule database (``HERMES_HOME/camofox-search/
-camofox-search.db``, see :mod:`rules`) is consulted first — a rule matching the
-configured engine id/domain supplies the SERP URL template and extraction JS —
-with the built-in engines from :mod:`engines` as the fallback. Content rules
-override the generic full-page text extraction in :meth:`extract` for matching
-domains. Rules are editable at runtime via the ``camofox-search-manage`` tool.
+Engine selection is rule-driven and multi-engine: ``CAMOFOX_SEARCH_ENGINE``
+(default ``duckduckgo google bing``) holds the engine list; for every entry the
+rule database (``HERMES_HOME/camofox-search/camofox-search.db``, see
+:mod:`rules`) is consulted first — a rule matching the engine id/domain
+supplies the SERP URL template and extraction JS — with the built-in engines
+from :mod:`engines` as the fallback. All engines are searched **in parallel**
+(one tab each) and their results are merged with hash-based URL deduplication
+(:func:`merge_search_rows`). Content rules override the generic full-page text
+extraction in :meth:`extract` for matching domains. Rules are editable at
+runtime via the ``camofox-search-manage`` tool.
 
 Response envelopes follow the Hermes legacy provider contract:
 
@@ -27,9 +31,13 @@ Response envelopes follow the Hermes legacy provider contract:
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -42,7 +50,7 @@ from .engines import (
     render_url_template,
 )
 from .rules import Rule
-from .settings import camofox_configured, camofox_user_id, default_engine
+from .settings import camofox_configured, camofox_user_id, default_engines
 
 logger = logging.getLogger(__name__)
 
@@ -110,18 +118,29 @@ class CamofoxSearchProvider(WebSearchProvider):
         except (TypeError, ValueError):
             limit = 5
 
-        try:
-            url, expression, label = _search_plan(default_engine(), query, limit)
-        except UnknownEngineError as exc:
-            return {"success": False, "error": f"{exc}{_RULE_HINT}"}
+        plans, unknown = _search_plans(default_engines(), query, limit)
+        if not plans:
+            return {"success": False, "error": "; ".join(unknown) + _RULE_HINT}
+        if unknown:
+            logger.warning("camofox-search: skipping unknown configured "
+                           "engine(s) for %r: %s", query, "; ".join(unknown))
 
         client = CamofoxClient()
-        try:
-            rows = collect_search_rows(client, url, expression, limit)
-            logger.info("camofox-search %r via %s: %d result(s)", query, label, len(rows))
-            return {"success": True, "data": {"web": rows}}
-        except CamofoxError as exc:
-            return {"success": False, "error": str(exc)}
+        outcomes = _run_plans(client, plans, limit)
+        healthy = [(label, rows) for label, rows, error in outcomes if error is None]
+        if not healthy:
+            first_error = next(error for _, _, error in outcomes if error is not None)
+            return {"success": False, "error": first_error}
+        failed = [label for label, _, error in outcomes if error is not None]
+        if failed:
+            logger.warning("camofox-search: engine(s) %s failed for %r; "
+                           "returning partial merged results",
+                           ", ".join(failed), query)
+        rows = merge_search_rows([rows for _, rows in healthy], MAX_LIMIT)
+        labels = ",".join(label for label, _ in healthy)
+        logger.info("camofox-search %r via %s: %d merged result(s)",
+                    query, labels, len(rows))
+        return {"success": True, "data": {"web": rows}}
 
     # ---- extract ----
 
@@ -141,20 +160,135 @@ class CamofoxSearchProvider(WebSearchProvider):
         return {"success": True, "data": entries}
 
 
-def _search_plan(selector: str, query: str, limit: int) -> tuple[str, str, str]:
-    """Resolve ``(url, js_expression, label)`` for one search.
+def _search_plans(selectors: list[str], query: str,
+                  limit: int) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Resolve ``(label, url, js_expression)`` plans for every engine selector.
 
     Rule database first — an engine id (``bing``), its domain (``bing.com``) or
     a subdomain (``cn.bing.com``) all resolve to the same rule — then the
-    built-in engines. Raises :class:`UnknownEngineError` when neither matches.
+    built-in engines. Returns ``(plans, unknown_errors)``: a selector matching
+    neither is reported instead of aborting the other engines.
     """
-    rule = _resolve_search_rule(selector)
-    if rule is not None and rule.url_template:
-        return (render_url_template(rule.url_template, query, limit),
-                render_extract_js(rule.extract_js, limit),
-                f"rule:{rule.domain}")
-    engine = get_engine(selector)
-    return engine.build_url(query, limit), engine.extract_js(limit), f"engine:{engine.name}"
+    plans: list[tuple[str, str, str]] = []
+    unknown: list[str] = []
+    for selector in selectors:
+        try:
+            rule = _resolve_search_rule(selector)
+            if rule is not None and rule.url_template:
+                plans.append((
+                    f"rule:{rule.domain}",
+                    render_url_template(rule.url_template, query, limit),
+                    render_extract_js(rule.extract_js, limit)))
+                continue
+            engine = get_engine(selector)
+        except UnknownEngineError as exc:
+            unknown.append(str(exc))
+            continue
+        plans.append((f"engine:{engine.name}",
+                      engine.build_url(query, limit), engine.extract_js(limit)))
+    return plans, unknown
+
+
+def _run_plans(client: CamofoxClient, plans: list[tuple[str, str, str]],
+               limit: int) -> list[tuple[str, list[dict[str, Any]], Optional[str]]]:
+    """Run every plan in parallel; returns ``(label, rows, error)`` per engine.
+
+    One worker thread per engine (each opens its own tab on the shared client),
+    so a broken or slow engine costs its own retry budget instead of the whole
+    search. An engine's :class:`CamofoxError` is captured for the caller rather
+    than masking the other engines' results.
+
+    Every worker runs inside a **copy of the caller's context**: the gateway's
+    per-turn secret scope is a ``ContextVar`` that fresh threads do not
+    inherit, so without the copy an env read inside a worker would fail closed
+    (``UnscopedSecretError``) on a multiplexed gateway.
+    """
+    outcomes: list[tuple[str, list[dict[str, Any]], Optional[str]]] = []
+    context = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=len(plans)) as pool:
+        futures = [
+            (label, pool.submit(context.copy().run, collect_search_rows,
+                                client, url, expression, limit))
+            for label, url, expression in plans
+        ]
+        for label, future in futures:
+            try:
+                outcomes.append((label, future.result(), None))
+            except CamofoxError as exc:
+                outcomes.append((label, [], str(exc)))
+    return outcomes
+
+
+def url_hash(url: str) -> str:
+    """Dedupe hash for a result URL.
+
+    Normalizes the variants different engines produce for the same page —
+    scheme, leading ``www.``, default port, fragment and trailing slash — then
+    hashes. Paths and query strings are compared as-is.
+    """
+    raw = str(url or "").strip()
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        default_port = ((parts.scheme == "http" and port == 80)
+                        or (parts.scheme == "https" and port == 443))
+        if port and not default_port:
+            host = f"{host}:{port}"
+        base = host + parts.path.rstrip("/")
+        if parts.query:
+            base += "?" + parts.query
+    except Exception:  # noqa: BLE001 - malformed URL: hash the raw text
+        base = raw
+    return hashlib.sha256(base.encode("utf-8", "replace")).hexdigest()
+
+
+def merge_search_rows(results_by_engine: list[list[dict[str, Any]]],
+                      cap: int) -> list[dict[str, Any]]:
+    """Merge per-engine result lists: rank-interleaved, hash-deduped, capped.
+
+    Engines contribute rows in their own ranking, interleaved rank-by-rank so
+    one engine cannot monopolize the merged list. Rows whose URLs hash to the
+    same page (:func:`url_hash`) merge into the first-seen row — empty title or
+    description fields are filled from later copies. ``position`` is
+    renumbered 1..N over the merged list, which is capped at ``cap`` rows.
+    """
+    merged: list[dict[str, Any]] = []
+    by_hash: dict[str, dict[str, Any]] = {}
+    rank = 0
+    while len(merged) < cap:
+        grew = False
+        for rows in results_by_engine:
+            if rank >= len(rows):
+                continue
+            grew = True
+            row = rows[rank]
+            key = url_hash(str(row.get("url") or ""))
+            existing = by_hash.get(key)
+            if existing is not None:
+                for field in ("title", "description"):
+                    if not existing[field] and str(row.get(field) or "").strip():
+                        existing[field] = str(row[field]).strip()
+                continue
+            entry: dict[str, Any] = {
+                "title": str(row.get("title") or "").strip(),
+                "url": str(row.get("url") or "").strip(),
+                "description": str(row.get("description") or "").strip(),
+                "position": len(merged) + 1,
+            }
+            by_hash[key] = entry
+            merged.append(entry)
+            if len(merged) >= cap:
+                break
+        if not grew:
+            break
+        rank += 1
+    return merged
 
 
 def ensure_profile_tab(client: CamofoxClient, user_id: str) -> bool:

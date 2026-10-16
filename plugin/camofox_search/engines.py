@@ -3,9 +3,9 @@
 Engines are plain data — engine domain, a SERP URL template and an extraction
 JS template — so the exact same shape can live in the plugin's rule database
 (:mod:`rules`) and be edited at runtime through the ``camofox-search-manage``
-tool. The built-ins here are both the seed values for that database (inserted
-once, never overwritten) and the fallback used when the rule store is
-unavailable.
+tool. The built-ins here are both the seed values for that database (created
+and seeded at plugin startup via ``INSERT OR IGNORE`` — edits are never
+overwritten) and the fallback used when the rule store is unavailable.
 
 Placeholders
 ------------

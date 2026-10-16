@@ -15,11 +15,14 @@ must refuse, not silently fall back to the launch profile's credentials.
 from __future__ import annotations
 
 import os
+import re
 
 DEFAULT_BASE_URL = "http://localhost:9377"
-DEFAULT_ENGINE = "bing"
+DEFAULT_ENGINE = "duckduckgo google bing"
 DEFAULT_USER_ID = "camofox_search"
 DEFAULT_TIMEOUT_SECONDS = 45.0
+
+_ENGINE_SEPARATOR_RE = re.compile(r"[\s,]+")
 
 
 def _env_value(name: str) -> str:
@@ -82,6 +85,24 @@ def camofox_user_id() -> str:
     return (_env_value("CAMOFOX_SEARCH_USER_ID") or DEFAULT_USER_ID).strip()
 
 
+def default_engines() -> list[str]:
+    """Configured search-engine list: ``CAMOFOX_SEARCH_ENGINE``.
+
+    Whitespace/comma-separated engine ids or domains; the default
+    ``"duckduckgo google bing"`` queries all three. Duplicates are dropped and
+    order is kept — the first entry is the primary engine.
+    """
+    raw = _env_value("CAMOFOX_SEARCH_ENGINE") or DEFAULT_ENGINE
+    engines: list[str] = []
+    for part in _ENGINE_SEPARATOR_RE.split(raw):
+        engine = part.strip().lower()
+        if engine and engine not in engines:
+            engines.append(engine)
+    if not engines:  # blank/garbage configuration: fall back to the default
+        engines = DEFAULT_ENGINE.split()
+    return engines
+
+
 def default_engine() -> str:
-    """Search engine id: ``CAMOFOX_SEARCH_ENGINE`` (default ``bing``), lowercased."""
-    return (_env_value("CAMOFOX_SEARCH_ENGINE") or DEFAULT_ENGINE).strip().lower()
+    """The primary configured engine (first entry of :func:`default_engines`)."""
+    return default_engines()[0]

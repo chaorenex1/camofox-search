@@ -17,13 +17,14 @@ Layout (per the plugin spec)::
 
 The table schema above is the contract; ``notes`` and the RFC-3339 timestamps
 are bookkeeping the manager tool surfaces back. The built-in engines from
-:mod:`engines` are seeded into ``search_rules`` on first creation
+:mod:`engines` are seeded into ``search_rules`` when the plugin starts
 (``INSERT OR IGNORE`` — an edited rule is never overwritten) so the table
 doubles as documentation of the default behavior.
 
-Resolution is by domain, so ``CAMOFOX_SEARCH_ENGINE`` may be an engine id
-(``bing``), a domain (``bing.com``) or a subdomain (``cn.bing.com``) — all
-three pick the same rule; longest-domain matches win.
+Resolution is by domain, so each entry of ``CAMOFOX_SEARCH_ENGINE`` (a
+whitespace/comma-separated list, default ``duckduckgo google bing``) may be an
+engine id (``bing``), a domain (``bing.com``) or a subdomain (``cn.bing.com``)
+— all three pick the same rule; longest-domain matches win.
 
 HERMES_HOME resolution order: ``CAMOFOX_SEARCH_DATA_DIR`` (explicit override,
 used by tests) → ``hermes_constants.get_hermes_home()`` (profile-aware inside

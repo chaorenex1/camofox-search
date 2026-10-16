@@ -86,8 +86,9 @@ ADVANCE_SCHEMA: dict[str, Any] = {
                 "description": (
                     "Catalog engine id, alias or domain (e.g. 'bing-cn', "
                     "'google', 'ddg', 'sogou-wechat', 'cn.bing.com'). Defaults "
-                    "to the plugin's configured engine (CAMOFOX_SEARCH_ENGINE) "
-                    "when that engine is in the advanced catalog."
+                    "to the plugin's configured engine (the first entry of "
+                    "CAMOFOX_SEARCH_ENGINE) when that engine is in the "
+                    "advanced catalog."
                 ),
             },
             "mode": {

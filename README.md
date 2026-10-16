@@ -9,6 +9,9 @@ anti-detection browser (Camoufox engine) instead of a hosted search API.
 - No API keys of its own: it uses the local Camofox server (`CAMOFOX_URL`, `CAMOFOX_API_KEY`)
 - Rule-driven: search engines and page extraction are defined in a SQLite
   database, editable at runtime via the bundled `camofox-search-manage` tool
+- Multi-engine search: `CAMOFOX_SEARCH_ENGINE` lists engines (default
+  `duckduckgo google bing`); every one is searched in parallel and the results
+  are merged with hash-based URL deduplication
 - Advanced search: the bundled `camofox-search-advance` tool builds per-engine
   SERP URLs (operators, time/language/region/vertical/pagination filters) and
   can execute them — see "Advanced search" below
@@ -33,13 +36,19 @@ window when the last tab closes and then refuses new pages, so the holder is
 what lets per-call tabs come and go. A context that still ends up broken
 (daemon restart, reaped holder) is reset and retried once, transparently.
 
-Engine selection is rule-driven: the rule database is consulted first — a rule
-matching the configured engine resolves the SERP URL template and extraction JS
-— with the built-in engines (`bing` default, `google`, `duckduckgo`) as the
-fallback. `CAMOFOX_SEARCH_ENGINE` selects by engine id or engine domain
-(`bing`, `bing.com` and `cn.bing.com` all resolve to the same rule; longest
-domain wins). The Bing extractor is verified against `cn.bing.com`;
-`google`/`duckduckgo` extractors are best-effort.
+Engine selection is rule-driven and multi-engine: `CAMOFOX_SEARCH_ENGINE` holds
+a whitespace/comma-separated engine list (default `duckduckgo google bing`).
+For every entry the rule database is consulted first — a rule matching the
+engine id or domain resolves the SERP URL template and extraction JS (`bing`,
+`bing.com` and `cn.bing.com` all resolve to the same rule; longest domain wins)
+— with the built-in engines (`duckduckgo`, `google`, `bing`) as the fallback.
+All engines are searched **in parallel** (one tab each on the shared profile)
+and their results are merged: duplicates (same URL modulo scheme/`www.`/
+fragment/trailing slash, keyed by hash) collapse into one row, engines
+interleave by rank, and the merged list is capped at 20 rows (Hermes trims it
+to the caller's count). An engine that fails or matches no rule is skipped
+while the others still contribute. The Bing extractor is verified against
+`cn.bing.com`; `google`/`duckduckgo` extractors are best-effort.
 
 ## Rules (search + content)
 
@@ -55,16 +64,17 @@ Data lives at `$HERMES_HOME/camofox-search/` (override with
   `{limit}` placeholders; `extract_js` is one page-context expression returning
   `JSON.stringify({ok:true,results:[{title,url,description}]})` (`@LIMIT@` is
   replaced with the requested count). Rules extend the engine set: create a
-  rule for `yandex.com`, point `CAMOFOX_SEARCH_ENGINE` at `yandex`, done.
+  rule for `yandex.com`, add `yandex` to `CAMOFOX_SEARCH_ENGINE`, done.
 - **Content rule** — `extract_js` returns
   `JSON.stringify({ok:true,title,url,text})` or a plain string. Matches the
   domain and every subdomain (longest match wins); an unusable rule result
   falls back to the default full-page text extraction, and the result metadata
   records the path (`metadata.extract_rule`, plus `extract_rule_attempted` on
   fallback).
-- The built-in engines are seeded into `search_rules` on first database
-  creation (`INSERT OR IGNORE` — edits are never overwritten), so the table
-  doubles as documentation of the default behavior.
+- The rule database is created and the built-in engines (`duckduckgo`,
+  `google`, `bing`) are seeded into `search_rules` at plugin startup
+  (`INSERT OR IGNORE` — edits are never overwritten), so the engine rules
+  always exist and the table doubles as documentation of the default behavior.
 - Rule trouble (unwritable DB, corrupt file) degrades gracefully: search falls
   back to the built-in engines, extraction to the default reader.
 

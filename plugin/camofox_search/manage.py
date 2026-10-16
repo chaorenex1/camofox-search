@@ -38,7 +38,7 @@ MANAGE_SCHEMA: dict[str, Any] = {
         "{query}/{limit} placeholders plus page-context extraction JS returning "
         "JSON.stringify({ok:true,results:[{title,url,description}]}); they drive "
         "web_search engine selection and let you add engines with no built-in "
-        "support (then point CAMOFOX_SEARCH_ENGINE at the domain). Content rules "
+        "support (then add its id or domain to CAMOFOX_SEARCH_ENGINE). Content rules "
         "map a content-page domain to extraction JS returning "
         "JSON.stringify({ok:true,title,url,text}) or a plain string, overriding "
         "generic web_extract output for that domain and its subdomains. Actions: "

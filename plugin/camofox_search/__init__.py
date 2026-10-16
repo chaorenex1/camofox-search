@@ -3,6 +3,10 @@
 Serviced capabilities: ``web_search`` and ``web_extract`` (selected via
 ``web.search_backend`` / ``web.extract_backend`` / ``web.backend``).
 
+At plugin startup the rule database (``HERMES_HOME/camofox-search/
+camofox-search.db``) is created and seeded with the built-in search rules
+(duckduckgo / google / bing).
+
 Also bundled:
 
 - toolset ``camofox-search``:
@@ -24,6 +28,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from . import rules as rule_store
 from .advance import ADVANCE_SCHEMA, TOOL_NAME as ADVANCE_TOOL_NAME, handle_advance
 from .import_cookies import (
     IMPORT_COOKIES_SCHEMA,
@@ -55,9 +60,28 @@ _IMPORT_COOKIES_TOOL_DESCRIPTION = (
 
 def register(ctx) -> None:
     """Hermes plugin entry point: provider + tools + bundled skills."""
+    _initialize_rule_store()
     ctx.register_web_search_provider(CamofoxSearchProvider())
     _register_tools(ctx)
     _register_skills(ctx)
+
+
+def _initialize_rule_store() -> None:
+    """Create and seed the rule database at plugin startup (best effort).
+
+    ``rules.ensure_db()`` creates the SQLite file with both tables and fills in
+    the built-in search rules (duckduckgo / google / bing) via ``INSERT OR
+    IGNORE``, so the engine rules always exist on a fresh start while edits are
+    never overwritten. A store problem (unwritable HERMES_HOME) logs a warning
+    and must never break plugin startup — the provider then degrades to the
+    built-in engines.
+    """
+    try:
+        path = rule_store.ensure_db()
+    except Exception as exc:  # noqa: BLE001 - startup must not fail the plugin
+        logger.warning("camofox-search: rule database initialization failed: %s", exc)
+        return
+    logger.info("camofox-search: rule database initialized at %s", path)
 
 
 def _register_tools(ctx) -> None:

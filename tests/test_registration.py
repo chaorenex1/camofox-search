@@ -86,6 +86,34 @@ def test_register_tolerates_capability_less_ctx():
     assert [provider.name for provider in ctx.providers] == ["camofox-search"]
 
 
+def test_register_initializes_rule_database_with_builtin_engines():
+    from plugin.camofox_search import rules as rule_store
+    from plugin.camofox_search.engines import ENGINES
+
+    ctx = RecordingCtx()
+    register(ctx)
+
+    listed = {rule.domain for rule in rule_store.list_search_rules()}
+    assert listed == {"duckduckgo.com", "google.com", "bing.com"}
+    assert rule_store.count_rules()["search_rules"] == len(ENGINES)
+
+
+def test_register_survives_rule_store_failure(monkeypatch):
+    from plugin.camofox_search import rules as rule_store
+
+    def boom():
+        raise RuntimeError("rule database unavailable")
+
+    monkeypatch.setattr(rule_store, "ensure_db", boom)
+    ctx = RecordingCtx()
+
+    register(ctx)  # must warn, not raise
+
+    assert [provider.name for provider in ctx.providers] == ["camofox-search"]
+    assert [tool["name"] for tool in ctx.tools] == [
+        TOOL_NAME, ADVANCE_TOOL_NAME, IMPORT_COOKIES_TOOL_NAME]
+
+
 def test_frontmatter_parser_handles_quotes_and_block_scalars():
     from plugin.camofox_search import _parse_frontmatter
 
