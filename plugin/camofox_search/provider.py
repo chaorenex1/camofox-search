@@ -24,9 +24,11 @@ Response envelopes follow the Hermes legacy provider contract:
 
 - ``search``:  ``{"success": True, "data": {"web": [{"title", "url",
   "description", "position"}, ...]}}``
-- ``extract``: ``{"success": True, "data": [{"url", "title", "content",
-  "raw_content", "metadata", "error"?, ...}]}``
-- failure:    ``{"success": False, "error": str}``
+- ``extract``: a **list** — ``[{"url", "title", "content", "raw_content",
+  "metadata"}, ...]`` with ``error`` on a per-URL failure (the
+  :class:`agent.web_search_provider.WebSearchProvider` contract the web_extract
+  dispatcher consumes)
+- failure:    ``{"success": False, "error": str}`` (search only)
 """
 
 from __future__ import annotations
@@ -144,20 +146,21 @@ class CamofoxSearchProvider(WebSearchProvider):
 
     # ---- extract ----
 
-    def extract(self, urls: list[str], **kwargs: Any) -> dict[str, Any]:
+    def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
+        """Extract readable text for every URL; failures stay per-URL.
+
+        Returns the list contract of :meth:`WebSearchProvider.extract` — the
+        web_extract dispatcher iterates the value directly, so an envelope dict
+        here raised ``'str' object has no attribute 'get'`` and lost every page.
+        """
         del kwargs  # ignore format/include_raw/max_chars: one text rendering is served
         cleaned = [str(u).strip() for u in (urls or []) if str(u).strip()]
         if not cleaned:
-            return {"success": False, "error": "No URLs provided to extract."}
+            return []
         cleaned = cleaned[:MAX_EXTRACT_URLS]
 
         client = CamofoxClient()
-        entries = [_extract_one(client, url) for url in cleaned]
-        ok = [entry for entry in entries if not entry.get("error")]
-        if not ok:
-            first_error = next((entry.get("error") for entry in entries if entry.get("error")), None)
-            return {"success": False, "error": first_error or "All extractions failed."}
-        return {"success": True, "data": entries}
+        return [_extract_one(client, url) for url in cleaned]
 
 
 def _search_plans(selectors: list[str], query: str,

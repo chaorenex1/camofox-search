@@ -427,10 +427,9 @@ def test_extract_success_and_partial_failure(fake_client, provider):
     }
     fake_client.create_error_urls = {"https://bad.example/"}
 
-    result = provider.extract(["https://good.example/", "https://bad.example/"])
+    entries = provider.extract(["https://good.example/", "https://bad.example/"])
 
-    assert result["success"] is True
-    good, bad = result["data"]
+    good, bad = entries
     assert good["url"] == "https://good.example/"
     assert good["title"] == "Example"
     assert good["content"] == "Hello body"
@@ -442,46 +441,42 @@ def test_extract_success_and_partial_failure(fake_client, provider):
     assert len(_calls(fake_client.instances[0], "close_tab")) == 1
 
 
-def test_extract_all_failed_returns_error(fake_client, provider):
+def test_extract_all_failed_reports_per_url_errors(fake_client, provider):
     fake_client.create_error = CamofoxError("daemon down")
 
-    result = provider.extract(["https://a.example/", "https://b.example/"])
+    entries = provider.extract(["https://a.example/", "https://b.example/"])
 
-    assert result["success"] is False
-    assert "daemon down" in result["error"]
+    assert [entry["url"] for entry in entries] == ["https://a.example/", "https://b.example/"]
+    assert all("daemon down" in entry["error"] for entry in entries)
 
 
 def test_extract_caps_url_count(fake_client, provider):
     fake_client.evaluate_result = {"ok": True, "title": "T", "url": "u", "text": "x"}
     urls = [f"https://site{i}.example/" for i in range(MAX_EXTRACT_URLS + 2)]
 
-    result = provider.extract(urls)
+    entries = provider.extract(urls)
 
-    assert result["success"] is True
-    assert len(result["data"]) == MAX_EXTRACT_URLS
+    assert len(entries) == MAX_EXTRACT_URLS
     assert len(_calls(fake_client.instances[0], "create_tab")) == MAX_EXTRACT_URLS
 
 
 def test_extract_empty_urls(provider):
-    result = provider.extract([])
-    assert result["success"] is False
-    assert "No URLs" in result["error"]
+    assert provider.extract([]) == []
 
 
 def test_extract_ignores_extra_kwargs(fake_client, provider):
     fake_client.evaluate_result = {"ok": True, "title": "T", "url": "u", "text": "x"}
-    result = provider.extract(["https://a.example/"], format="markdown", include_raw=True,
-                              max_chars=1000)
-    assert result["success"] is True
+    entries = provider.extract(["https://a.example/"], format="markdown", include_raw=True,
+                               max_chars=1000)
+    assert entries[0]["content"] == "x"
 
 
 def test_extract_unreadable_page_reports_error(fake_client, provider):
     fake_client.evaluate_result = {"ok": False}
 
-    result = provider.extract(["https://a.example/"])
+    entry = provider.extract(["https://a.example/"])[0]
 
-    assert result["success"] is False
-    assert "could not read page content" in result["error"]
+    assert "could not read page content" in entry["error"]
     assert len(_calls(fake_client.instances[0], "close_tab")) == 1
 
 
@@ -559,10 +554,9 @@ def test_extract_uses_content_rule(fake_client, provider):
     fake_client.evaluate_result = {"ok": True, "title": "CR",
                                    "url": "https://good.example/", "text": "rule body"}
 
-    result = provider.extract(["https://good.example/page"])
+    entries = provider.extract(["https://good.example/page"])
 
-    assert result["success"] is True
-    entry = result["data"][0]
+    entry = entries[0]
     assert entry["title"] == "CR"
     assert entry["content"] == "rule body"
     assert entry["raw_content"] == "rule body"
@@ -576,7 +570,7 @@ def test_extract_rule_string_result_is_content(fake_client, provider):
 
     result = provider.extract(["https://str.example/"])
 
-    entry = result["data"][0]
+    entry = result[0]
     assert entry["content"] == "plain string body"
     assert entry["metadata"]["extract_rule"] == "str.example"
 
@@ -591,7 +585,7 @@ def test_extract_content_rule_falls_back_to_default(fake_client, provider):
 
     result = provider.extract(["https://good.example/"])
 
-    entry = result["data"][0]
+    entry = result[0]
     assert entry["content"] == "default body"
     assert entry["metadata"]["extract_rule"] == "default"
     assert entry["metadata"]["extract_rule_attempted"] == "good.example"
@@ -605,7 +599,7 @@ def test_extract_default_metadata_without_rule(fake_client, provider):
 
     result = provider.extract(["https://no-rule.example/"])
 
-    metadata = result["data"][0]["metadata"]
+    metadata = result[0]["metadata"]
     assert metadata["extract_rule"] == "default"
     assert "extract_rule_attempted" not in metadata
 
@@ -619,5 +613,4 @@ def test_extract_falls_back_when_rule_lookup_fails(fake_client, monkeypatch, pro
 
     result = provider.extract(["https://a.example/"])
 
-    assert result["success"] is True
-    assert result["data"][0]["content"] == "x"
+    assert result[0]["content"] == "x"
